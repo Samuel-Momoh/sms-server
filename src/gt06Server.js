@@ -6,7 +6,7 @@
  * Supports two protocols on the same TCP port (default 5022):
  *
  *   GT06  – Binary protocol, frames start with 0x78 0x78
- *   HQ    – ASCII protocol,  messages start with *HQ,
+ *   HQ    – ASCII protocol (H02/A3/Secumore), messages start with *HQ,
  *
  * Protocol is auto-detected per TCP connection from the first bytes received.
  * A single connection always uses one protocol for its lifetime.
@@ -14,19 +14,35 @@
  * Environment variables:
  *   GT06_PORT       TCP port to listen on            (default: 5022)
  *   GPS_RAW_DEBUG   Log raw bytes / ASCII messages   (default: false)
- *   HQ_SEND_ACK     Send ACK responses to HQ packets (default: false)
  */
 
 const net        = require('net');
 const { logger } = require('./logger');
 
-// Dynamic flag checkers (respects runtime env changes)
-const isRawDebug  = () => process.env.GPS_RAW_DEBUG === 'true';
-const isHqSendAck = () => process.env.HQ_SEND_ACK   === 'true';
+// Dynamic flag checker for raw debugging
+const isRawDebug = () => process.env.GPS_RAW_DEBUG === 'true';
 
 // ── Device registry: IMEI → socket ───────────────────────────────────────────
 // Lets us push commands or track active connections by IMEI
 const deviceRegistry = new Map();
+
+// Helper to convert V1 packet's HHMMSS into YYYYMMDDHHMMSS using today's UTC date
+function formatV1Timestamp(timeRaw, date = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const yyyy = date.getUTCFullYear();
+  const mm   = pad(date.getUTCMonth() + 1);
+  const dd   = pad(date.getUTCDate());
+  const datePart = `${yyyy}${mm}${dd}`;
+
+  if (timeRaw && /^\d{6}$/.test(timeRaw.substring(0, 6))) {
+    return `${datePart}${timeRaw.substring(0, 6)}`;
+  }
+
+  const hh  = pad(date.getUTCHours());
+  const min = pad(date.getUTCMinutes());
+  const ss  = pad(date.getUTCSeconds());
+  return `${datePart}${hh}${min}${ss}`;
+}
 
 // =============================================================================
 // GT06 — CRC-16 / CCITT-FALSE (XModem)
@@ -96,7 +112,14 @@ function handleGt06Login(socket, data) {
   });
 
   const ack = buildAck(0x01, serialNo);
-  socket.write(ack);
+  socket.write(ack, (err) => {
+    if (err) {
+      logger.error('GT06_WRITE_ERROR', {
+        remote:  `${socket.remoteAddress}:${socket.remotePort}`,
+        message: err.message,
+      });
+    }
+  });
 
   logger.info('GT06_ACK_SENT', {
     protocol: '0x01 (login)',
@@ -144,7 +167,14 @@ function handleGt06Location(socket, data, protocolNumber) {
 function handleGt06Heartbeat(socket, data) {
   const serialNo = data.subarray(data.length - 6, data.length - 4);
   const ack      = buildAck(0x13, serialNo);
-  socket.write(ack);
+  socket.write(ack, (err) => {
+    if (err) {
+      logger.error('GT06_WRITE_ERROR', {
+        remote:  `${socket.remoteAddress}:${socket.remotePort}`,
+        message: err.message,
+      });
+    }
+  });
 
   logger.info('GT06_ACK_SENT', {
     protocol: '0x13 (heartbeat)',
@@ -222,20 +252,70 @@ function nmeaToDecimal(nmea, hemisphere) {
 }
 
 // =============================================================================
-// HQ — ACK Builder
+// HQ / H02 / A3 — ACK Builder
 // =============================================================================
 
 /**
- * Build HQ ACK response packet.
+ * Build HQ / H02 / A3 protocol ACK response packet.
  *
- * Standard format: *HQ,<IMEI>,V4,0,<CMD>#\r\n
+ * Formats:
+ *   - V1 GPS confirmation (V4): *HQ,<IMEI>,V4,V1,<YYYYMMDDHHMMSS>#\r\n
+ *   - V0 Login confirmation:    *HQ,<IMEI>,V0#\r\n
+ *   - Heartbeat confirmation:   *HQ,<IMEI>,HTBT#\r\n
  *
- * @param {string} imei
- * @param {string} cmd   e.g. 'HTBT', 'V1'
+ * @param {string} imei         Device IMEI / ID
+ * @param {string} cmd          Command being acknowledged ('V1', 'V0', 'HTBT')
+ * @param {string} [timestamp]  YYYYMMDDHHMMSS timestamp (derived from packet HHMMSS + UTC date)
  * @returns {string}
  */
-function buildHqAck(imei, cmd) {
-  return `*HQ,${imei},V4,0,${cmd}#\r\n`;
+function buildHqAck(imei, cmd, timestamp) {
+  if (cmd === 'V1') {
+    const ts = timestamp || formatV1Timestamp();
+    return `*HQ,${imei},V4,V1,${ts}#\r\n`;
+  }
+  if (cmd === 'V0') {
+    return `*HQ,${imei},V0#\r\n`;
+  }
+  if (cmd === 'HTBT') {
+    return `*HQ,${imei},HTBT#\r\n`;
+  }
+  return `*HQ,${imei},${cmd}#\r\n`;
+}
+
+// =============================================================================
+// HQ — Socket Safe Write Helper
+// =============================================================================
+
+/**
+ * Sends response to the tracker over TCP, checks write callback/error,
+ * and logs the exact ASCII and hex bytes sent.
+ *
+ * @param {net.Socket} socket
+ * @param {string}     imei
+ * @param {string}     ackResponse
+ */
+function sendHqResponse(socket, imei, ackResponse) {
+  const hex = Buffer.from(ackResponse).toString('hex');
+
+  socket.write(ackResponse, (err) => {
+    if (err) {
+      logger.error('HQ_WRITE_ERROR', {
+        imei,
+        remote:        `${socket.remoteAddress}:${socket.remotePort}`,
+        error:         err.message,
+        responseAscii: ackResponse,
+        responseHex:   hex,
+      });
+      return;
+    }
+  });
+
+  logger.info('HQ_ACK_SENT', {
+    imei,
+    remote:        `${socket.remoteAddress}:${socket.remotePort}`,
+    responseAscii: ackResponse,
+    responseHex:   hex,
+  });
 }
 
 // =============================================================================
@@ -274,6 +354,18 @@ function parseHqMessage(message) {
 // HQ — Packet Handlers
 // =============================================================================
 
+function handleHqLogin(socket, imei, fields) {
+  logger.info('HQ_LOGIN', {
+    event:    'HQ_LOGIN',
+    protocol: 'HQ',
+    imei,
+    remote:   `${socket.remoteAddress}:${socket.remotePort}`,
+  });
+
+  const ack = buildHqAck(imei, 'V0');
+  sendHqResponse(socket, imei, ack);
+}
+
 function handleHqGps(socket, imei, fields) {
   // Expected fields after cmd=V1:
   // [0] HHMMSS [1] A/V [2] LAT [3] N/S [4] LON [5] E/W [6] SPEED ...
@@ -305,9 +397,15 @@ function handleHqGps(socket, imei, fields) {
     gpsStatus: gpsStatus || '',
     timestamp,
   });
+
+  // Respond immediately with H02/A3 V4 confirmation response: *HQ,<IMEI>,V4,V1,<YYYYMMDDHHMMSS>#\r\n
+  // Timestamp is derived from V1 packet's HHMMSS + today's UTC date YYYYMMDD
+  const v4Timestamp = formatV1Timestamp(timeRaw);
+  const ack = buildHqAck(imei, 'V1', v4Timestamp);
+  sendHqResponse(socket, imei, ack);
 }
 
-function handleHqHeartbeat(socket, imei) {
+function handleHqHeartbeat(socket, imei, fields) {
   logger.info('HQ_HEARTBEAT', {
     event:    'HQ_HEARTBEAT',
     protocol: 'HQ',
@@ -315,16 +413,9 @@ function handleHqHeartbeat(socket, imei) {
     remote:   `${socket.remoteAddress}:${socket.remotePort}`,
   });
 
-  if (isHqSendAck()) {
-    const ack = buildHqAck(imei, 'HTBT');
-    socket.write(ack);
-    logger.info('HQ_ACK_SENT', {
-      remote: `${socket.remoteAddress}:${socket.remotePort}`,
-      imei,
-      ascii:  ack,
-      hex:    Buffer.from(ack).toString('hex'),
-    });
-  }
+  // Respond with HQ Heartbeat ACK: *HQ,<IMEI>,HTBT#\r\n
+  const ack = buildHqAck(imei, 'HTBT');
+  sendHqResponse(socket, imei, ack);
 }
 
 function handleHqPacket(socket, message) {
@@ -350,11 +441,14 @@ function handleHqPacket(socket, message) {
   deviceRegistry.set(imei, socket);
 
   switch (cmd) {
+    case 'V0':
+      handleHqLogin(socket, imei, fields);
+      break;
     case 'V1':
       handleHqGps(socket, imei, fields);
       break;
     case 'HTBT':
-      handleHqHeartbeat(socket, imei);
+      handleHqHeartbeat(socket, imei, fields);
       break;
     default:
       logger.warn('HQ_UNKNOWN_CMD', {
@@ -559,6 +653,9 @@ function createGt06Server(port) {
       buffer:   Buffer.alloc(0),
     };
 
+    socket.setKeepAlive(true, 30000);
+    socket.setNoDelay(true);
+
     logger.info('TCP_CLIENT_CONNECTED', {
       remote: `${socket.remoteAddress}:${socket.remotePort}`,
     });
@@ -609,9 +706,11 @@ module.exports = {
   createGt06Server,
   nmeaToDecimal,
   parseHqMessage,
+  formatV1Timestamp,
   buildHqAck,
   buildAck,
   crc16,
+  sendHqResponse,
   handleHqPacket,
   handleGt06Packet,
   _processBuffer:     processBuffer,
