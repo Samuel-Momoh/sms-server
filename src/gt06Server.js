@@ -220,6 +220,8 @@ function createGt06Server(port) {
           // Lost frame sync — discard and wait for next connection
           logger.warn('GT06_RESYNC', {
             remote: `${socket.remoteAddress}:${socket.remotePort}`,
+            hex: buffer.subarray(0, Math.min(buffer.length, 64)).toString('hex'),
+            length: buffer.length,
           });
           buffer = Buffer.alloc(0);
           break;
