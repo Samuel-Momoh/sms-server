@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 
 const BASE_URL = process.env.NODE_ENV === 'development'
   ? `http://localhost:${PORT}`
-  : 'https://sms-server-xxkb.onrender.com';
+  : `http://140.238.88.183:${PORT}`;
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 app.use(express.json());
