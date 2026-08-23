@@ -1,10 +1,11 @@
 require('dotenv').config();
 
-const express        = require('express');
-const swaggerUi      = require('swagger-ui-express');
-const { sendSms }        = require('./src/infobip');
-const { normalizePhone } = require('./src/normalizePhone');
-const { logger }         = require('./src/logger');
+const express              = require('express');
+const swaggerUi            = require('swagger-ui-express');
+const { sendSms }          = require('./src/infobip');
+const { normalizePhone }   = require('./src/normalizePhone');
+const { logger }           = require('./src/logger');
+const { createGt06Server } = require('./src/gt06Server');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -253,3 +254,6 @@ app.listen(PORT, () => {
     env:     process.env.NODE_ENV || 'production',
   });
 });
+
+// Start the GT06 GPS tracker TCP server on a separate port (default: 5022)
+createGt06Server();
