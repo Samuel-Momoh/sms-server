@@ -6,7 +6,8 @@
     "start": "node index.js",
     "dev": "node --watch index.js",
     "gt06:test": "node test/gt06-simulator.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "hq:test": "node test/hq-simulator.js",
+    "test": "node test/gt06-hq.test.js"
   },
   "keywords": [],
   "author": "",
