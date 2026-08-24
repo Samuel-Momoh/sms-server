@@ -4,6 +4,7 @@ const assert = require('assert');
 const {
   nmeaToDecimal,
   parseHqMessage,
+  parseEquStatus,
   formatV1Timestamp,
   buildHqAck,
   buildAck,
@@ -400,31 +401,113 @@ try {
   console.log('✅ Test I Passed!\n');
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST J: Server Graceful Shutdown (closeGt06Server)
+  // TEST K: Cantrack equ_status parsing (ACC, alarms, power status)
   // ───────────────────────────────────────────────────────────────────────────
-  console.log('Test J: Server graceful shutdown (closeGt06Server)');
-  const mockSockJ = createMockSocket('10.0.0.2', 60002);
-  const stateJ = {
+  console.log('Test K: Cantrack equ_status parsing (ACC, alarms, power status)');
+  // Example 1: Operating state with ACC ON (Byte 3 bit 2 = 1 -> 0xFF): FFFFFFFF
+  const accOnStatus = parseEquStatus('FFFFFFFF');
+  assert.strictEqual(accOnStatus.accOn, true, 'Expected ACC to be ON for FFFFFFFF');
+  assert.strictEqual(accOnStatus.alarms.length, 0, 'Expected no alarms');
+  assert.strictEqual(accOnStatus.isOilCut, false);
+
+  // Example 2: Parked / stationary state with ACC OFF (Byte 3 = 0xFB -> bit 2 = 0): FFFFFBFF
+  const parkedStatus = parseEquStatus('FFFFFBFF');
+  assert.strictEqual(parkedStatus.accOn, false, 'Expected ACC to be OFF for FFFFFBFF');
+  assert.strictEqual(parkedStatus.alarms.length, 0, 'Expected no alarms');
+
+  // Example 3: SOS alarm + ACC OFF + Main Power Cut: FFEBFBFF
+  // Byte 1 = 0xFF
+  // Byte 2 = 0xEB (bit 4=0: power cut, bit 2=0: SOS)
+  // Byte 3 = 0xFB (bit 2=0: ACC off)
+  // Byte 4 = 0xFF
+  const alarmStatus = parseEquStatus('FFEBFBFF');
+  assert.strictEqual(alarmStatus.accOn, false, 'Expected ACC to be OFF');
+  assert(alarmStatus.alarms.includes('SOS'), 'Expected SOS alarm');
+  assert(alarmStatus.alarms.includes('POWER_CUT'), 'Expected POWER_CUT alarm');
+  console.log('✅ Test K Passed!\n');
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST L: Speed Knots to km/h conversion, Direction, & DDMMYY Date
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log('Test L: Cantrack V1 Speed (knots to km/h), Direction, & Date format');
+  // 10.00 knots -> 18.52 km/h, direction 180 deg, date 100815 (10 Aug 2015), ACC ON (FFFFFFFF)
+  const msgL = '*HQ,865205030330012,V1,145452,A,2240.55181,N,11358.32389,E,10.00,180,100815,FFFFFFFF#\r\n';
+  const mockSockL = createMockSocket();
+  const stateL = { protocol: null, buffer: Buffer.from(msgL) };
+  mockSockL._trackerState = stateL;
+  _processBuffer(mockSockL, stateL);
+
+  const logL = capturedLogs.find((l) => l.event === 'HQ_GPS_UPDATE' && l.data.imei === '865205030330012');
+  assert(logL, 'Expected HQ_GPS_UPDATE event');
+  assert.strictEqual(logL.data.speed_knots, 10.00);
+  assert.strictEqual(logL.data.speed_kmh, 18.52, 'Expected 10.00 knots * 1.852 = 18.52 km/h');
+  assert.strictEqual(logL.data.direction, 180, 'Expected direction = 180');
+  assert.strictEqual(logL.data.timestamp, '2015-08-10 14:54:52 UTC');
+  assert.strictEqual(logL.data.accOn, true);
+
+  // ACK should contain date 20150810145452
+  const ackLogL = capturedLogs.find((l) => l.event === 'HQ_ACK_SENT' && l.data.imei === '865205030330012');
+  assert(ackLogL, 'Expected ACK sent');
+  assert.strictEqual(ackLogL.data.responseAscii, '*HQ,865205030330012,V4,V1,20150810145452#\r\n');
+  console.log('✅ Test L Passed!\n');
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST M: V2 GPS, V3 LBS, and V4 Command Confirmation packets
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log('Test M: Handling V2 (GPS), V3 (LBS), and V4 (Command Confirmation) packets');
+  const mockSockM = createMockSocket();
+  const stateM = { protocol: null, buffer: Buffer.alloc(0) };
+  mockSockM._trackerState = stateM;
+
+  // V2 GPS packet
+  stateM.buffer = Buffer.from('*HQ,865205030330012,V2,150421,A,2240.55841,N,11358.33462,E,2.06,0,100815,FFFFFBFF#\r\n');
+  _processBuffer(mockSockM, stateM);
+  const logM_v2 = capturedLogs.find((l) => l.event === 'HQ_GPS_UPDATE' && l.data.cmd === 'V2');
+  assert(logM_v2, 'Expected V2 GPS update log');
+
+  // V3 LBS packet
+  stateM.buffer = Buffer.from('*HQ,865205030330012,V3,000201,46000,07,009350,004022,132,-88,0256,0,X,010915,FFFFFBFF#\r\n');
+  _processBuffer(mockSockM, stateM);
+  const logM_v3 = capturedLogs.find((l) => l.event === 'HQ_LBS_UPDATE');
+  assert(logM_v3, 'Expected V3 LBS update log');
+
+  // V4 Confirm packet
+  stateM.buffer = Buffer.from('*HQ,865205030330012,V4,S2,150950,151007,A,2240.55503,N,11358.35174,E,0.85,0,100815,FFFFFBFF#\r\n');
+  _processBuffer(mockSockM, stateM);
+  const logM_v4 = capturedLogs.find((l) => l.event === 'HQ_COMMAND_CONFIRM');
+  assert(logM_v4, 'Expected V4 command confirm log');
+  assert.strictEqual(logM_v4.data.cmdConfirmed, 'S2');
+  console.log('✅ Test M Passed!\n');
+
+  // Clean registry before shutdown test
+  deviceRegistry.clear();
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST N: Server Graceful Shutdown (closeGt06Server)
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log('Test N: Server graceful shutdown (closeGt06Server)');
+  const mockSockN = createMockSocket('10.0.0.2', 60002);
+  const stateN = {
     protocol: 'HQ',
     buffer: Buffer.alloc(0),
     imei: '867232054850999',
     closeReason: 'remote_tracker_close',
   };
-  mockSockJ._trackerState = stateJ;
-  deviceRegistry.set('867232054850999', mockSockJ);
+  mockSockN._trackerState = stateN;
+  deviceRegistry.set('867232054850999', mockSockN);
 
   const mockServer = {
     close: (cb) => { if (cb) cb(); },
   };
 
   closeGt06Server(mockServer, 'server_shutdown').then(() => {
-    assert.strictEqual(mockSockJ.isDestroyed, true, 'Active socket should be destroyed on server shutdown');
-    assert.strictEqual(stateJ.closeReason, 'server_shutdown');
+    assert.strictEqual(mockSockN.isDestroyed, true, 'Active socket should be destroyed on server shutdown');
+    assert.strictEqual(stateN.closeReason, 'server_shutdown');
     assert.strictEqual(deviceRegistry.size, 0, 'Registry should be empty after server shutdown');
-    console.log('✅ Test J Passed!\n');
+    console.log('✅ Test N Passed!\n');
+    console.log('🎉 ALL TESTS PASSED SUCCESSFULLY!');
   });
-
-  console.log('🎉 ALL TESTS PASSED SUCCESSFULLY!');
 } finally {
   restoreLogs();
 }
+

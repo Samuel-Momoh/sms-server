@@ -13,7 +13,7 @@
  *
  * Environment variables:
  *   GT06_PORT            TCP port to listen on                           (default: 5022)
- *   TCP_KEEPALIVE_DELAY  Initial TCP keepalive delay in ms               (default: 60000)
+ *   TCP_KEEPALIVE_DELAY  Initial TCP keepalive delay in ms               (default: 300000)
  *   GPS_RAW_DEBUG        Log raw bytes / ASCII messages                  (default: false)
  */
 
@@ -23,30 +23,124 @@ const { logger } = require('./logger');
 // Dynamic flag checker for raw debugging
 const isRawDebug = () => process.env.GPS_RAW_DEBUG === 'true';
 
-// Configurable TCP keepalive delay in ms (default: 60000ms = 60s)
-// Should exceed periodic tracking intervals (e.g. 30s) so probes don't collide with normal reports
-const getKeepAliveDelay = () => parseInt(process.env.TCP_KEEPALIVE_DELAY, 10) || 60000;
+// Configurable TCP keepalive delay in ms (default: 300000ms = 5 minutes)
+// Accommodates moving (30s) and stationary/sleep intervals (e.g. 180s–300s)
+const getKeepAliveDelay = () => parseInt(process.env.TCP_KEEPALIVE_DELAY, 10) || 300000;
 
 // ── Device registry: IMEI → socket ───────────────────────────────────────────
 // Lets us push commands or track active connections by IMEI
 const deviceRegistry = new Map();
 
-// Helper to convert V1 packet's HHMMSS into YYYYMMDDHHMMSS using today's UTC date
-function formatV1Timestamp(timeRaw, date = new Date()) {
+// Helper to convert V1/V2 packet's HHMMSS into YYYYMMDDHHMMSS
+// Uses packet's DDMMYY dateRaw if provided, falling back to today's UTC date
+function formatV1Timestamp(timeRaw, dateRawOrDate, fallbackDate = new Date()) {
   const pad = (n) => String(n).padStart(2, '0');
-  const yyyy = date.getUTCFullYear();
-  const mm   = pad(date.getUTCMonth() + 1);
-  const dd   = pad(date.getUTCDate());
-  const datePart = `${yyyy}${mm}${dd}`;
+  let datePart = '';
+
+  if (typeof dateRawOrDate === 'string' && /^\d{6}$/.test(dateRawOrDate)) {
+    // dateRaw in DDMMYY format (e.g. '100815' -> 20150810, '240826' -> 20260824)
+    const dd = dateRawOrDate.substring(0, 2);
+    const mm = dateRawOrDate.substring(2, 4);
+    const yy = dateRawOrDate.substring(4, 6);
+    datePart = `20${yy}${mm}${dd}`;
+  } else {
+    const d = (dateRawOrDate instanceof Date) ? dateRawOrDate : fallbackDate;
+    const yyyy = d.getUTCFullYear();
+    const mm   = pad(d.getUTCMonth() + 1);
+    const dd   = pad(d.getUTCDate());
+    datePart = `${yyyy}${mm}${dd}`;
+  }
 
   if (timeRaw && /^\d{6}$/.test(timeRaw.substring(0, 6))) {
     return `${datePart}${timeRaw.substring(0, 6)}`;
   }
 
-  const hh  = pad(date.getUTCHours());
-  const min = pad(date.getUTCMinutes());
-  const ss  = pad(date.getUTCSeconds());
+  const d = (dateRawOrDate instanceof Date) ? dateRawOrDate : fallbackDate;
+  const hh  = pad(d.getUTCHours());
+  const min = pad(d.getUTCMinutes());
+  const ss  = pad(d.getUTCSeconds());
   return `${datePart}${hh}${min}${ss}`;
+}
+
+/**
+ * Parse Cantrack 4-byte equ_status hexadecimal string (e.g. "FFFFFBFF").
+ * Uses negative logic where bit=0 indicates active/alarm state.
+ *
+ * @param {string} equStatusHex 8-character hex string
+ * @returns {{
+ *   raw: string,
+ *   accOn: boolean,
+ *   gpsFixed: boolean,
+ *   isBackupBattery: boolean,
+ *   isOilCut: boolean,
+ *   doorOpen: boolean,
+ *   alarms: string[]
+ * }}
+ */
+function parseEquStatus(equStatusHex) {
+  if (!equStatusHex || typeof equStatusHex !== 'string' || equStatusHex.length < 8) {
+    return {
+      raw: equStatusHex || '',
+      accOn: true,
+      gpsFixed: true,
+      isBackupBattery: false,
+      isOilCut: false,
+      doorOpen: false,
+      alarms: [],
+    };
+  }
+
+  const b1 = parseInt(equStatusHex.substring(0, 2), 16) || 0xFF;
+  const b2 = parseInt(equStatusHex.substring(2, 4), 16) || 0xFF;
+  const b3 = parseInt(equStatusHex.substring(4, 6), 16) || 0xFF;
+  const b4 = parseInt(equStatusHex.substring(6, 8), 16) || 0xFF;
+
+  const alarms = [];
+
+  // Byte 1
+  const isAntiTamperAlarm    = (b1 & 0x04) === 0;
+  const isOilCut             = (b1 & 0x08) === 0;
+  const isBatteryRemoveAlarm = (b1 & 0x10) === 0;
+
+  if (isAntiTamperAlarm)    alarms.push('ANTI_TAMPER');
+  if (isBatteryRemoveAlarm) alarms.push('BATTERY_REMOVED');
+
+  // Byte 2
+  const gpsFixed             = (b2 & 0x01) === 0; // bit 0: 0=located
+  const isSosAlarm           = (b2 & 0x04) === 0;
+  const isBackupBattery      = (b2 & 0x08) === 0; // bit 3: 0=powered by backup battery
+  const isPowerCutAlarm      = (b2 & 0x10) === 0;
+
+  if (isSosAlarm)      alarms.push('SOS');
+  if (isPowerCutAlarm) alarms.push('POWER_CUT');
+
+  // Byte 3
+  const doorOpen             = (b3 & 0x01) === 0;
+  const accOn                = (b3 & 0x04) !== 0; // bit 2: 0=ACC OFF, 1=ACC ON
+  const isVibrationAlarm     = (b3 & 0x08) === 0;
+  const isLowBatteryAlarm    = (b3 & 0x10) === 0;
+
+  if (isVibrationAlarm)  alarms.push('VIBRATION');
+  if (isLowBatteryAlarm) alarms.push('LOW_BATTERY');
+
+  // Byte 4
+  const isOverspeedAlarm     = (b4 & 0x04) === 0;
+  const isFenceInAlarm       = (b4 & 0x10) === 0;
+  const isFenceOutAlarm      = (b4 & 0x80) === 0;
+
+  if (isOverspeedAlarm) alarms.push('OVERSPEED');
+  if (isFenceInAlarm)   alarms.push('FENCE_IN');
+  if (isFenceOutAlarm)  alarms.push('FENCE_OUT');
+
+  return {
+    raw: equStatusHex,
+    accOn,
+    gpsFixed,
+    isBackupBattery,
+    isOilCut,
+    doorOpen,
+    alarms,
+  };
 }
 
 /**
@@ -324,7 +418,7 @@ function nmeaToDecimal(nmea, hemisphere) {
  * @returns {string}
  */
 function buildHqAck(imei, cmd, timestamp) {
-  if (cmd === 'V1') {
+  if (cmd === 'V1' || cmd === 'V2') {
     const ts = timestamp || formatV1Timestamp();
     return `*HQ,${imei},V4,V1,${ts}#\r\n`;
   }
@@ -424,20 +518,27 @@ function handleHqLogin(socket, imei, fields, state) {
   sendHqResponse(socket, imei, ack);
 }
 
-function handleHqGps(socket, imei, fields, state) {
+function handleHqGps(socket, imei, fields, state, cmd = 'V1') {
   if (state) state.lastActivityAt = new Date().toISOString();
   else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
 
-  // Expected fields after cmd=V1:
-  // [0] HHMMSS [1] A/V [2] LAT [3] N/S [4] LON [5] E/W [6] SPEED ...
-  const [timeRaw, gpsStatus, latRaw, latHemi, lonRaw, lonHemi, speedRaw] = fields;
+  // Cantrack V1/V2 fields:
+  // [0] HHMMSS [1] S (A/V/B) [2] LAT [3] N/S [4] LON [5] E/W [6] SPEED (knots) [7] DIRECTION (0-359) [8] DDMMYY [9] equ_status (hex)
+  const [timeRaw, gpsStatus, latRaw, latHemi, lonRaw, lonHemi, speedRaw, directionRaw, dateRaw, equStatusRaw] = fields;
 
   let timestamp = '';
   if (timeRaw && timeRaw.length >= 6) {
     const hh = timeRaw.substring(0, 2);
     const mm = timeRaw.substring(2, 4);
     const ss = timeRaw.substring(4, 6);
-    timestamp = `${hh}:${mm}:${ss}`;
+    if (dateRaw && dateRaw.length >= 6) {
+      const dd = dateRaw.substring(0, 2);
+      const mon = dateRaw.substring(2, 4);
+      const yy = dateRaw.substring(4, 6);
+      timestamp = `20${yy}-${mon}-${dd} ${hh}:${mm}:${ss} UTC`;
+    } else {
+      timestamp = `${hh}:${mm}:${ss}`;
+    }
   }
 
   const rawLatDecimal = nmeaToDecimal(latRaw || '', latHemi || '');
@@ -445,24 +546,39 @@ function handleHqGps(socket, imei, fields, state) {
 
   const latitude  = isNaN(rawLatDecimal) ? null : parseFloat(rawLatDecimal.toFixed(6));
   const longitude = isNaN(rawLonDecimal) ? null : parseFloat(rawLonDecimal.toFixed(6));
-  const speed     = speedRaw ? parseFloat(speedRaw) : 0;
+
+  // Speed is transmitted in Knots according to Cantrack manual (1 knot = 1.852 km/h)
+  const speedKnots = speedRaw ? parseFloat(speedRaw) : 0;
+  const validKnots = isNaN(speedKnots) ? 0 : speedKnots;
+  const speedKmh   = parseFloat((validKnots * 1.852).toFixed(2));
+
+  const direction     = directionRaw ? parseInt(directionRaw, 10) || 0 : 0;
+  const vehicleStatus = parseEquStatus(equStatusRaw);
 
   logger.info('HQ_GPS_UPDATE', {
-    event:     'HQ_GPS_UPDATE',
-    protocol:  'HQ',
+    event:           'HQ_GPS_UPDATE',
+    protocol:        'HQ',
+    cmd,
     imei,
-    remote:    `${socket.remoteAddress}:${socket.remotePort}`,
+    remote:          `${socket.remoteAddress}:${socket.remotePort}`,
     latitude,
     longitude,
-    speed:     isNaN(speed) ? 0 : speed,
-    gpsStatus: gpsStatus || '',
+    speed:           speedKmh,
+    speed_knots:     validKnots,
+    speed_kmh:       speedKmh,
+    direction,
+    gpsStatus:       gpsStatus || '',
+    accOn:           vehicleStatus.accOn,
+    alarms:          vehicleStatus.alarms.length > 0 ? vehicleStatus.alarms : undefined,
+    isBackupBattery: vehicleStatus.isBackupBattery,
+    isOilCut:        vehicleStatus.isOilCut,
+    equStatusHex:    equStatusRaw || undefined,
     timestamp,
   });
 
   // Respond immediately with H02/A3 V4 confirmation response: *HQ,<IMEI>,V4,V1,<YYYYMMDDHHMMSS>#\r\n
-  // Timestamp is derived from V1 packet's HHMMSS + today's UTC date YYYYMMDD
-  const v4Timestamp = formatV1Timestamp(timeRaw);
-  const ack = buildHqAck(imei, 'V1', v4Timestamp);
+  const v4Timestamp = formatV1Timestamp(timeRaw, dateRaw);
+  const ack = buildHqAck(imei, cmd, v4Timestamp);
   sendHqResponse(socket, imei, ack);
 }
 
@@ -480,6 +596,38 @@ function handleHqHeartbeat(socket, imei, fields, state) {
   // Respond with HQ Heartbeat ACK: *HQ,<IMEI>,HTBT#\r\n
   const ack = buildHqAck(imei, 'HTBT');
   sendHqResponse(socket, imei, ack);
+}
+
+function handleHqLbs(socket, imei, fields, state) {
+  if (state) state.lastActivityAt = new Date().toISOString();
+  else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
+
+  // V3 Format: HHMMSS, Base_Info (MCC, MNC, Base_Number, LAC1, Cell_ID1, ...), Battery_Info, Failure_Info, Cont, DDMMYY, equ_status
+  const [timeRaw, ...rest] = fields;
+  logger.info('HQ_LBS_UPDATE', {
+    event:    'HQ_LBS_UPDATE',
+    protocol: 'HQ',
+    imei,
+    remote:   `${socket.remoteAddress}:${socket.remotePort}`,
+    timeRaw,
+    details:  rest,
+  });
+}
+
+function handleHqConfirm(socket, imei, fields, state) {
+  if (state) state.lastActivityAt = new Date().toISOString();
+  else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
+
+  // V4 confirm response from device for server command (e.g. S1, S2, S20, etc.)
+  const [cmdConfirmed, ...rest] = fields;
+  logger.info('HQ_COMMAND_CONFIRM', {
+    event:        'HQ_COMMAND_CONFIRM',
+    protocol:     'HQ',
+    imei,
+    remote:       `${socket.remoteAddress}:${socket.remotePort}`,
+    cmdConfirmed,
+    details:      rest,
+  });
 }
 
 function handleHqPacket(socket, message, state) {
@@ -509,7 +657,14 @@ function handleHqPacket(socket, message, state) {
       handleHqLogin(socket, imei, fields, state);
       break;
     case 'V1':
-      handleHqGps(socket, imei, fields, state);
+    case 'V2':
+      handleHqGps(socket, imei, fields, state, cmd);
+      break;
+    case 'V3':
+      handleHqLbs(socket, imei, fields, state);
+      break;
+    case 'V4':
+      handleHqConfirm(socket, imei, fields, state);
       break;
     case 'HTBT':
       handleHqHeartbeat(socket, imei, fields, state);
@@ -870,6 +1025,7 @@ module.exports = {
   registerDevice,
   nmeaToDecimal,
   parseHqMessage,
+  parseEquStatus,
   formatV1Timestamp,
   buildHqAck,
   buildAck,
