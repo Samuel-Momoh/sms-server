@@ -5,7 +5,7 @@ const swaggerUi            = require('swagger-ui-express');
 const { sendSms }          = require('./src/infobip');
 const { normalizePhone }   = require('./src/normalizePhone');
 const { logger }           = require('./src/logger');
-const { createGt06Server } = require('./src/gt06Server');
+const { createGt06Server, closeGt06Server } = require('./src/gt06Server');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -246,7 +246,7 @@ app.post('/send-sms', async (req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   logger.info('SERVER_STARTED', {
     port:    PORT,
     baseUrl: BASE_URL,
@@ -256,4 +256,39 @@ app.listen(PORT, () => {
 });
 
 // Start the GT06 GPS tracker TCP server on a separate port (default: 5022)
-createGt06Server();
+const gt06Server = createGt06Server();
+
+// ── Graceful Shutdown Handlers ────────────────────────────────────────────────
+let isShuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  const source = signal === 'SIGTERM' ? 'systemd_or_process_manager' : 'terminal_interrupt';
+  logger.info('SERVER_SHUTDOWN', {
+    signal,
+    source,
+    message: `Received ${signal} (${source}), shutting down gracefully...`,
+  });
+
+  try {
+    await closeGt06Server(gt06Server, 'server_shutdown');
+  } catch (err) {
+    logger.error('GT06_SERVER_CLOSE_ERROR', { message: err.message });
+  }
+
+  httpServer.close(() => {
+    logger.info('HTTP_SERVER_STOPPED', { signal });
+    process.exit(0);
+  });
+
+  // Force exit after 5 seconds if graceful shutdown takes too long
+  setTimeout(() => {
+    logger.warn('FORCE_EXIT', { message: 'Forcing process exit after shutdown timeout' });
+    process.exit(0);
+  }, 5000).unref();
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
+

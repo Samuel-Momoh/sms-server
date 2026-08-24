@@ -12,8 +12,9 @@
  * A single connection always uses one protocol for its lifetime.
  *
  * Environment variables:
- *   GT06_PORT       TCP port to listen on            (default: 5022)
- *   GPS_RAW_DEBUG   Log raw bytes / ASCII messages   (default: false)
+ *   GT06_PORT            TCP port to listen on                           (default: 5022)
+ *   TCP_KEEPALIVE_DELAY  Initial TCP keepalive delay in ms               (default: 60000)
+ *   GPS_RAW_DEBUG        Log raw bytes / ASCII messages                  (default: false)
  */
 
 const net        = require('net');
@@ -21,6 +22,10 @@ const { logger } = require('./logger');
 
 // Dynamic flag checker for raw debugging
 const isRawDebug = () => process.env.GPS_RAW_DEBUG === 'true';
+
+// Configurable TCP keepalive delay in ms (default: 60000ms = 60s)
+// Should exceed periodic tracking intervals (e.g. 30s) so probes don't collide with normal reports
+const getKeepAliveDelay = () => parseInt(process.env.TCP_KEEPALIVE_DELAY, 10) || 60000;
 
 // ── Device registry: IMEI → socket ───────────────────────────────────────────
 // Lets us push commands or track active connections by IMEI
@@ -42,6 +47,50 @@ function formatV1Timestamp(timeRaw, date = new Date()) {
   const min = pad(date.getUTCMinutes());
   const ss  = pad(date.getUTCSeconds());
   return `${datePart}${hh}${min}${ss}`;
+}
+
+/**
+ * Register an active socket for an IMEI in the device registry.
+ * If a different socket was previously registered for this IMEI,
+ * cleanly destroy the older socket so it doesn't linger or timeout.
+ *
+ * @param {string} imei
+ * @param {net.Socket} socket
+ * @param {string} protocol
+ * @param {object} [state]
+ */
+function registerDevice(imei, socket, protocol, state) {
+  if (!imei || !socket) return;
+
+  const trackerState = state || socket._trackerState || {};
+  trackerState.imei = imei;
+  trackerState.lastActivityAt = new Date().toISOString();
+
+  const existingSocket = deviceRegistry.get(imei);
+  if (existingSocket && existingSocket !== socket) {
+    const oldRemote = existingSocket.remoteAddress ? `${existingSocket.remoteAddress}:${existingSocket.remotePort}` : 'unknown';
+    const newRemote = socket.remoteAddress ? `${socket.remoteAddress}:${socket.remotePort}` : 'unknown';
+
+    logger.warn('DEVICE_RECONNECTED', {
+      imei,
+      protocol: protocol || trackerState.protocol || 'unknown',
+      oldRemote,
+      newRemote,
+      action: 'replacing_previous_connection',
+    });
+
+    try {
+      if (existingSocket._trackerState) {
+        existingSocket._trackerState.closeReason = 'replaced_by_new_connection';
+        existingSocket._trackerState.isDestroyedLocally = true;
+      }
+      existingSocket.destroy();
+    } catch (_) {
+      // Ignore errors when destroying lingering socket
+    }
+  }
+
+  deviceRegistry.set(imei, socket);
 }
 
 // =============================================================================
@@ -100,11 +149,11 @@ function buildAck(protocolNumber, serialNoBuffer) {
 // GT06 — Packet Handlers
 // =============================================================================
 
-function handleGt06Login(socket, data) {
+function handleGt06Login(socket, data, state) {
   const imeiHex  = data.subarray(4, 12).toString('hex');
   const serialNo = data.subarray(data.length - 6, data.length - 4);
 
-  deviceRegistry.set(imeiHex, socket);
+  registerDevice(imeiHex, socket, 'GT06', state);
 
   logger.info('GT06_LOGIN', {
     remote:  `${socket.remoteAddress}:${socket.remotePort}`,
@@ -127,7 +176,10 @@ function handleGt06Login(socket, data) {
   });
 }
 
-function handleGt06Location(socket, data, protocolNumber) {
+function handleGt06Location(socket, data, protocolNumber, state) {
+  if (state) state.lastActivityAt = new Date().toISOString();
+  else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
+
   const year   = data[4];
   const month  = data[5];
   const day    = data[6];
@@ -164,7 +216,10 @@ function handleGt06Location(socket, data, protocolNumber) {
   });
 }
 
-function handleGt06Heartbeat(socket, data) {
+function handleGt06Heartbeat(socket, data, state) {
+  if (state) state.lastActivityAt = new Date().toISOString();
+  else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
+
   const serialNo = data.subarray(data.length - 6, data.length - 4);
   const ack      = buildAck(0x13, serialNo);
   socket.write(ack, (err) => {
@@ -182,7 +237,7 @@ function handleGt06Heartbeat(socket, data) {
   });
 }
 
-function handleGt06Packet(socket, frame) {
+function handleGt06Packet(socket, frame, state) {
   if (isRawDebug()) {
     logger.info('GT06_RAW', {
       remote: `${socket.remoteAddress}:${socket.remotePort}`,
@@ -201,10 +256,10 @@ function handleGt06Packet(socket, frame) {
   const protocolNumber = frame[3];
 
   switch (protocolNumber) {
-    case 0x01: handleGt06Login(socket, frame);                    break;
+    case 0x01: handleGt06Login(socket, frame, state);                    break;
     case 0x12:
-    case 0x22: handleGt06Location(socket, frame, protocolNumber); break;
-    case 0x13: handleGt06Heartbeat(socket, frame);                break;
+    case 0x22: handleGt06Location(socket, frame, protocolNumber, state); break;
+    case 0x13: handleGt06Heartbeat(socket, frame, state);                break;
     default:
       logger.warn('GT06_UNKNOWN_PROTOCOL', {
         remote:   `${socket.remoteAddress}:${socket.remotePort}`,
@@ -354,7 +409,10 @@ function parseHqMessage(message) {
 // HQ — Packet Handlers
 // =============================================================================
 
-function handleHqLogin(socket, imei, fields) {
+function handleHqLogin(socket, imei, fields, state) {
+  if (state) state.lastActivityAt = new Date().toISOString();
+  else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
+
   logger.info('HQ_LOGIN', {
     event:    'HQ_LOGIN',
     protocol: 'HQ',
@@ -366,7 +424,10 @@ function handleHqLogin(socket, imei, fields) {
   sendHqResponse(socket, imei, ack);
 }
 
-function handleHqGps(socket, imei, fields) {
+function handleHqGps(socket, imei, fields, state) {
+  if (state) state.lastActivityAt = new Date().toISOString();
+  else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
+
   // Expected fields after cmd=V1:
   // [0] HHMMSS [1] A/V [2] LAT [3] N/S [4] LON [5] E/W [6] SPEED ...
   const [timeRaw, gpsStatus, latRaw, latHemi, lonRaw, lonHemi, speedRaw] = fields;
@@ -405,7 +466,10 @@ function handleHqGps(socket, imei, fields) {
   sendHqResponse(socket, imei, ack);
 }
 
-function handleHqHeartbeat(socket, imei, fields) {
+function handleHqHeartbeat(socket, imei, fields, state) {
+  if (state) state.lastActivityAt = new Date().toISOString();
+  else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
+
   logger.info('HQ_HEARTBEAT', {
     event:    'HQ_HEARTBEAT',
     protocol: 'HQ',
@@ -418,7 +482,7 @@ function handleHqHeartbeat(socket, imei, fields) {
   sendHqResponse(socket, imei, ack);
 }
 
-function handleHqPacket(socket, message) {
+function handleHqPacket(socket, message, state) {
   if (isRawDebug()) {
     logger.info('HQ_RAW', {
       remote: `${socket.remoteAddress}:${socket.remotePort}`,
@@ -438,17 +502,17 @@ function handleHqPacket(socket, message) {
 
   const { imei, cmd, fields } = parsed;
 
-  deviceRegistry.set(imei, socket);
+  registerDevice(imei, socket, 'HQ', state);
 
   switch (cmd) {
     case 'V0':
-      handleHqLogin(socket, imei, fields);
+      handleHqLogin(socket, imei, fields, state);
       break;
     case 'V1':
-      handleHqGps(socket, imei, fields);
+      handleHqGps(socket, imei, fields, state);
       break;
     case 'HTBT':
-      handleHqHeartbeat(socket, imei, fields);
+      handleHqHeartbeat(socket, imei, fields, state);
       break;
     default:
       logger.warn('HQ_UNKNOWN_CMD', {
@@ -500,7 +564,7 @@ function processGt06Buffer(socket, state) {
     const frame  = state.buffer.subarray(0, frameLength);
     state.buffer = state.buffer.subarray(frameLength);
 
-    handleGt06Packet(socket, frame);
+    handleGt06Packet(socket, frame, state);
   }
 }
 
@@ -570,7 +634,7 @@ function processHqBuffer(socket, state) {
 
     if (!message || message.trim().length === 0) continue;
 
-    handleHqPacket(socket, message);
+    handleHqPacket(socket, message, state);
   }
 }
 
@@ -641,7 +705,7 @@ function processBuffer(socket, state) {
 }
 
 // =============================================================================
-// Server Factory
+// Server Factory & Lifecycle
 // =============================================================================
 
 function createGt06Server(port) {
@@ -651,9 +715,23 @@ function createGt06Server(port) {
     const state = {
       protocol: null,
       buffer:   Buffer.alloc(0),
+      imei:     null,
+      connectedAt:    new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+      closeReason:    'remote_tracker_close',
+      lastError:      null,
+      errorCode:      null,
+      errorSyscall:   null,
+      isDestroyedLocally: false,
     };
 
-    socket.setKeepAlive(true, 30000);
+    socket._trackerState = state;
+
+    // Explicitly disable inactivity timeout so Node never abruptly terminates long-lived connections
+    socket.setTimeout(0);
+
+    // Keepalive initial delay: defaults to 60s (or TCP_KEEPALIVE_DELAY), higher than 30s reporting intervals
+    socket.setKeepAlive(true, getKeepAliveDelay());
     socket.setNoDelay(true);
 
     logger.info('TCP_CLIENT_CONNECTED', {
@@ -661,29 +739,84 @@ function createGt06Server(port) {
     });
 
     socket.on('data', (chunk) => {
+      state.lastActivityAt = new Date().toISOString();
       state.buffer = Buffer.concat([state.buffer, chunk]);
       processBuffer(socket, state);
     });
 
-    socket.on('close', () => {
-      // Clean up device registry if mapped to this socket
-      for (const [imei, sock] of deviceRegistry.entries()) {
-        if (sock === socket) {
-          deviceRegistry.delete(imei);
-        }
-      }
-
-      logger.info('DEVICE_DISCONNECTED', {
+    socket.on('timeout', () => {
+      state.closeReason = 'local_timeout';
+      logger.warn('SOCKET_TIMEOUT', {
         remote:   `${socket.remoteAddress}:${socket.remotePort}`,
+        imei:     state.imei || undefined,
         protocol: state.protocol || 'unknown',
       });
     });
 
     socket.on('error', (err) => {
+      state.lastError    = err.message;
+      state.errorCode    = err.code;
+      state.errorSyscall = err.syscall;
+
+      if (!state.isDestroyedLocally) {
+        state.closeReason = 'tcp_error';
+      }
+
       logger.error('SOCKET_ERROR', {
         remote:   `${socket.remoteAddress}:${socket.remotePort}`,
         protocol: state.protocol || 'unknown',
+        imei:     state.imei || undefined,
         message:  err.message,
+        code:     err.code,
+        syscall:  err.syscall,
+      });
+    });
+
+    socket.on('close', (hadError) => {
+      // Safe registry cleanup: only delete if this socket is currently the registered socket for this IMEI
+      if (state.imei) {
+        if (deviceRegistry.get(state.imei) === socket) {
+          deviceRegistry.delete(state.imei);
+        }
+      } else {
+        for (const [imei, sock] of deviceRegistry.entries()) {
+          if (sock === socket) {
+            deviceRegistry.delete(imei);
+          }
+        }
+      }
+
+      let disconnectType = 'remote_tracker_close';
+      if (state.closeReason === 'server_shutdown') {
+        disconnectType = 'server_shutdown';
+      } else if (state.closeReason === 'replaced_by_new_connection' || state.isDestroyedLocally) {
+        disconnectType = 'local_destroy';
+      } else if (state.closeReason === 'local_timeout') {
+        disconnectType = 'local_timeout';
+      } else if (hadError || state.lastError) {
+        if (state.errorCode === 'ETIMEDOUT' || (state.lastError && state.lastError.includes('ETIMEDOUT'))) {
+          disconnectType = 'tcp_timeout_error';
+        } else if (state.errorCode === 'ECONNRESET' || (state.lastError && state.lastError.includes('ECONNRESET'))) {
+          disconnectType = 'tcp_reset_error';
+        } else {
+          disconnectType = 'tcp_error';
+        }
+      }
+
+      const durationMs = Date.now() - new Date(state.connectedAt).getTime();
+
+      logger.info('DEVICE_DISCONNECTED', {
+        remote:         `${socket.remoteAddress}:${socket.remotePort}`,
+        protocol:       state.protocol || 'unknown',
+        imei:           state.imei || undefined,
+        reason:         state.closeReason,
+        disconnectType,
+        hadError:       Boolean(hadError),
+        error:          state.lastError || undefined,
+        errorCode:      state.errorCode || undefined,
+        durationMs,
+        connectedAt:    state.connectedAt,
+        lastActivityAt: state.lastActivityAt,
       });
     });
   });
@@ -702,8 +835,39 @@ function createGt06Server(port) {
   return server;
 }
 
+/**
+ * Gracefully close the GT06 TCP server and all active tracker connections.
+ *
+ * @param {net.Server} server
+ * @param {string}     [reason='server_shutdown']
+ * @returns {Promise<void>}
+ */
+function closeGt06Server(server, reason = 'server_shutdown') {
+  if (!server) return Promise.resolve();
+
+  for (const [imei, sock] of deviceRegistry.entries()) {
+    try {
+      if (sock._trackerState) {
+        sock._trackerState.closeReason = reason;
+        sock._trackerState.isDestroyedLocally = true;
+      }
+      sock.destroy();
+    } catch (_) {}
+  }
+  deviceRegistry.clear();
+
+  return new Promise((resolve) => {
+    server.close(() => {
+      logger.info('GT06_SERVER_STOPPED', { reason });
+      resolve();
+    });
+  });
+}
+
 module.exports = {
   createGt06Server,
+  closeGt06Server,
+  registerDevice,
   nmeaToDecimal,
   parseHqMessage,
   formatV1Timestamp,

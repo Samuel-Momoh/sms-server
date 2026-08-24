@@ -10,18 +10,37 @@ const {
   crc16,
   _processBuffer,
   deviceRegistry,
+  registerDevice,
+  closeGt06Server,
 } = require('../src/gt06Server');
 const { logger } = require('../src/logger');
 
 // Mock socket to capture logs and writes
 function createMockSocket(remoteAddress = '127.0.0.1', remotePort = 12345, failWrite = false) {
   const written = [];
-  return {
+  let isDestroyed = false;
+  const eventHandlers = {};
+
+  const socket = {
     remoteAddress,
     remotePort,
     written,
+    get isDestroyed() { return isDestroyed; },
+    setTimeout: () => {},
     setKeepAlive: () => {},
     setNoDelay: () => {},
+    on: (evt, handler) => {
+      if (!eventHandlers[evt]) eventHandlers[evt] = [];
+      eventHandlers[evt].push(handler);
+      return socket;
+    },
+    emit: (evt, ...args) => {
+      if (eventHandlers[evt]) {
+        for (const handler of eventHandlers[evt]) {
+          handler(...args);
+        }
+      }
+    },
     write: (data, cb) => {
       if (failWrite) {
         if (cb) cb(new Error('Simulated write failure'));
@@ -30,7 +49,14 @@ function createMockSocket(remoteAddress = '127.0.0.1', remotePort = 12345, failW
       written.push(data);
       if (cb) cb(null);
     },
+    destroy: () => {
+      isDestroyed = true;
+      if (socket._trackerState) {
+        socket._trackerState.isDestroyedLocally = true;
+      }
+    },
   };
+  return socket;
 }
 
 // Capture logger calls
@@ -58,7 +84,7 @@ function restoreLogs() {
   logger.error = origError;
 }
 
-console.log('Running GT06 & HQ Protocol Unit Tests...\n');
+console.log('Running GT06 & HQ Protocol Automated Tests...\n');
 
 try {
   startCapturingLogs();
@@ -86,9 +112,9 @@ try {
   assert(Math.abs(latA - 4.88826) < 0.0001, `Lat expected ~4.88826, got ${latA}`);
   assert(Math.abs(lonA - 6.9132067) < 0.0001, `Lon expected ~6.9132067, got ${lonA}`);
 
-  // Feed into mock socket via _processBuffer
   const mockSockA = createMockSocket();
   const stateA = { protocol: null, buffer: Buffer.from(msgA + '\n') };
+  mockSockA._trackerState = stateA;
   _processBuffer(mockSockA, stateA);
 
   const logA = capturedLogs.find((l) => l.event === 'HQ_GPS_UPDATE');
@@ -115,13 +141,13 @@ try {
   const msgB = '*HQ,867232054850970,HTBT#\r\n';
   const mockSockB = createMockSocket();
   const stateB = { protocol: null, buffer: Buffer.from(msgB) };
+  mockSockB._trackerState = stateB;
   _processBuffer(mockSockB, stateB);
 
   const logB = capturedLogs.find((l) => l.event === 'HQ_HEARTBEAT');
   assert(logB, 'Expected HQ_HEARTBEAT log event');
   assert.strictEqual(logB.data.imei, '867232054850970');
 
-  // Check HQ_ACK_SENT for HTBT: must be *HQ,<IMEI>,HTBT#\r\n
   const ackLogB = capturedLogs.find((l) => l.event === 'HQ_ACK_SENT' && l.data.responseAscii.includes('HTBT'));
   assert(ackLogB, 'Expected HQ_ACK_SENT log event for HTBT');
   assert.strictEqual(ackLogB.data.imei, '867232054850970');
@@ -137,6 +163,7 @@ try {
   const msgC = '*HQ,867232054850970,V0#\r\n';
   const mockSockC = createMockSocket();
   const stateC = { protocol: null, buffer: Buffer.from(msgC) };
+  mockSockC._trackerState = stateC;
   _processBuffer(mockSockC, stateC);
 
   const logC = capturedLogs.find((l) => l.event === 'HQ_LOGIN');
@@ -156,6 +183,7 @@ try {
   console.log('Test D: Fragmented TCP stream reassembly');
   const mockSockD = createMockSocket();
   const stateD = { protocol: null, buffer: Buffer.alloc(0) };
+  mockSockD._trackerState = stateD;
 
   const chunk1 = Buffer.from('*HQ,8672320548');
   const chunk2 = Buffer.from('50970,V1,210046,A,0453.2956,N,00654.7924,E,0.00,0,\n');
@@ -179,6 +207,7 @@ try {
   console.log('Test E: Multiple HQ messages in one chunk');
   const mockSockE = createMockSocket();
   const stateE = { protocol: null, buffer: Buffer.alloc(0) };
+  mockSockE._trackerState = stateE;
 
   const multiChunk = Buffer.from(
     '*HQ,867232054850970,V1,210046,A,0453.2956,N,00654.7924,E,0.00,0,\n*HQ,867232054850970,HTBT#\r\n'
@@ -200,6 +229,7 @@ try {
   console.log('Test F: Socket write failure error logging');
   const mockSockF = createMockSocket('127.0.0.1', 9999, true /* failWrite */);
   const stateF = { protocol: 'HQ', buffer: Buffer.from('*HQ,867232054850970,HTBT#\r\n') };
+  mockSockF._trackerState = stateF;
   _processBuffer(mockSockF, stateF);
 
   const writeErrLog = capturedLogs.find((l) => l.event === 'HQ_WRITE_ERROR');
@@ -208,60 +238,191 @@ try {
   console.log('✅ Test F Passed!\n');
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST G: Existing GT06 Login packet
+  // TEST G: Continuous tracking simulation over multiple cycles (minutes)
   // ───────────────────────────────────────────────────────────────────────────
-  console.log('Test G: GT06 Login packet');
-  const mockSockG = createMockSocket();
-  const stateG = { protocol: null, buffer: Buffer.alloc(0) };
+  console.log('Test G: Continuous tracking simulation (V1 packets every 30s for 6 cycles = 3 minutes)');
+  const mockSockG = createMockSocket('192.168.1.100', 50220);
+  const stateG = {
+    protocol: null,
+    buffer: Buffer.alloc(0),
+    imei: null,
+    connectedAt: new Date().toISOString(),
+    lastActivityAt: new Date().toISOString(),
+    closeReason: 'remote_tracker_close',
+  };
+  mockSockG._trackerState = stateG;
 
-  // GT06 Login frame:
-  // 78 78 (start) 0d (len) 01 (protocol) 01 23 45 67 89 01 23 40 (imei) 00 01 (serial) <crc2> 0d 0a
-  const imeiBytes = Buffer.from([0x01, 0x23, 0x45, 0x67, 0x89, 0x01, 0x23, 0x40]);
-  const serialNo = Buffer.from([0x00, 0x01]);
-  const payloadG = Buffer.concat([Buffer.from([0x0d, 0x01]), imeiBytes, serialNo]);
-  const crcValG = crc16(payloadG);
-  const crcBufG = Buffer.alloc(2);
-  crcBufG.writeUInt16BE(crcValG, 0);
-  const gt06LoginFrame = Buffer.concat([
-    Buffer.from([0x78, 0x78]),
-    payloadG,
-    crcBufG,
-    Buffer.from([0x0D, 0x0A]),
-  ]);
-
-  stateG.buffer = gt06LoginFrame;
+  // Step 1: V0 Login
+  stateG.buffer = Buffer.from('*HQ,867232054850970,V0#\r\n');
   _processBuffer(mockSockG, stateG);
+  assert.strictEqual(stateG.protocol, 'HQ');
+  assert.strictEqual(deviceRegistry.get('867232054850970'), mockSockG);
+  assert.strictEqual(mockSockG.written.length, 1);
+  assert.strictEqual(mockSockG.written[0], '*HQ,867232054850970,V0#\r\n');
 
-  assert.strictEqual(stateG.protocol, 'GT06');
-  const loginLog = capturedLogs.find((l) => l.event === 'GT06_LOGIN');
-  assert(loginLog, 'Expected GT06_LOGIN log event');
-  assert.strictEqual(loginLog.data.imeiHex, '0123456789012340');
-  assert.strictEqual(mockSockG.written.length, 1, 'Expected ACK to be written back to tracker');
+  // Step 2: 6 consecutive V1 updates (representing continuous tracking)
+  const timestamps = ['094229', '094259', '094329', '094359', '094429', '094459'];
+  for (let i = 0; i < timestamps.length; i++) {
+    const ts = timestamps[i];
+    const gpsMsg = `*HQ,867232054850970,V1,${ts},A,0453.2956,N,00654.7924,E,0.00,0,\n`;
+    stateG.buffer = Buffer.from(gpsMsg);
+    _processBuffer(mockSockG, stateG);
+
+    // Verify ACK sent for this packet
+    const expectedAckPrefix = `*HQ,867232054850970,V4,V1,`;
+    const lastWritten = mockSockG.written[mockSockG.written.length - 1];
+    assert(lastWritten.startsWith(expectedAckPrefix), `Expected V4 ACK for cycle ${i}, got: ${lastWritten}`);
+    assert(lastWritten.includes(ts), `Expected ACK to contain time ${ts}`);
+  }
+
+  assert.strictEqual(mockSockG.written.length, 7, 'Expected 1 login ACK + 6 GPS ACKs = 7 total');
+  assert.strictEqual(mockSockG.isDestroyed, false, 'Socket should remain open and connected');
   console.log('✅ Test G Passed!\n');
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST H: Existing GT06 Heartbeat packet
+  // TEST H: Reconnecting with the same IMEI (duplicate connection handling)
   // ───────────────────────────────────────────────────────────────────────────
-  console.log('Test H: GT06 Heartbeat packet');
-  const mockSockH = createMockSocket();
-  const stateH = { protocol: 'GT06', buffer: Buffer.alloc(0) };
+  console.log('Test H: Reconnecting with same IMEI (old socket cleanup & registry safety)');
+  const mockSockH1 = createMockSocket('192.168.1.101', 50221);
+  const stateH1 = {
+    protocol: null,
+    buffer: Buffer.alloc(0),
+    imei: null,
+    connectedAt: new Date().toISOString(),
+    lastActivityAt: new Date().toISOString(),
+    closeReason: 'remote_tracker_close',
+  };
+  mockSockH1._trackerState = stateH1;
 
-  const hbPayload = Buffer.from([0x05, 0x13, 0x00, 0x02]); // len=5, proto=0x13, serial=0x0002
-  const crcValH = crc16(hbPayload);
-  const crcBufH = Buffer.alloc(2);
-  crcBufH.writeUInt16BE(crcValH, 0);
-  const gt06HeartbeatFrame = Buffer.concat([
+  // Socket 1 connects and registers IMEI
+  stateH1.buffer = Buffer.from('*HQ,867232054850970,V0#\r\n');
+  _processBuffer(mockSockH1, stateH1);
+  assert.strictEqual(deviceRegistry.get('867232054850970'), mockSockH1);
+
+  // Now Socket 2 connects with the same IMEI
+  const mockSockH2 = createMockSocket('192.168.1.102', 50222);
+  const stateH2 = {
+    protocol: null,
+    buffer: Buffer.alloc(0),
+    imei: null,
+    connectedAt: new Date().toISOString(),
+    lastActivityAt: new Date().toISOString(),
+    closeReason: 'remote_tracker_close',
+  };
+  mockSockH2._trackerState = stateH2;
+
+  stateH2.buffer = Buffer.from('*HQ,867232054850970,V1,094500,A,0453.2956,N,00654.7924,E,0.00,0,\n');
+  _processBuffer(mockSockH2, stateH2);
+
+  // Verify Socket 1 was destroyed and marked as replaced
+  assert.strictEqual(mockSockH1.isDestroyed, true, 'Old socket should be destroyed on reconnection');
+  assert.strictEqual(stateH1.closeReason, 'replaced_by_new_connection');
+  assert.strictEqual(stateH1.isDestroyedLocally, true);
+
+  // Verify deviceRegistry now points to Socket 2
+  assert.strictEqual(deviceRegistry.get('867232054850970'), mockSockH2, 'Registry must point to Socket 2');
+
+  // Verify DEVICE_RECONNECTED log was emitted
+  const reconnectLog = capturedLogs.find((l) => l.event === 'DEVICE_RECONNECTED' && l.data.imei === '867232054850970');
+  assert(reconnectLog, 'Expected DEVICE_RECONNECTED log event');
+
+  // Now simulate Socket 1 close event — verify it does NOT unregister Socket 2!
+  if (stateH1.imei && deviceRegistry.get(stateH1.imei) === mockSockH1) {
+    deviceRegistry.delete(stateH1.imei);
+  }
+  assert.strictEqual(deviceRegistry.get('867232054850970'), mockSockH2, 'Old socket close must not delete new socket from registry');
+
+  // Simulate Socket 2 close event — verify it cleans up registry
+  if (stateH2.imei && deviceRegistry.get(stateH2.imei) === mockSockH2) {
+    deviceRegistry.delete(stateH2.imei);
+  }
+  assert.strictEqual(deviceRegistry.get('867232054850970'), undefined, 'Active socket close must remove itself from registry');
+  console.log('✅ Test H Passed!\n');
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST I: GT06 Protocol Packets (Login, Location, Heartbeat, Resync)
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log('Test I: GT06 Protocol frames (0x01 login, 0x12/0x22 GPS, 0x13 heartbeat, resync)');
+  const mockSockI = createMockSocket('10.0.0.1', 60001);
+  const stateI = { protocol: null, buffer: Buffer.alloc(0) };
+  mockSockI._trackerState = stateI;
+
+  // GT06 Login frame: 78 78 0d 01 ...
+  const imeiBytesI = Buffer.from([0x01, 0x23, 0x45, 0x67, 0x89, 0x01, 0x23, 0x40]);
+  const serialNoI = Buffer.from([0x00, 0x01]);
+  const payloadI = Buffer.concat([Buffer.from([0x0d, 0x01]), imeiBytesI, serialNoI]);
+  const crcValI = crc16(payloadI);
+  const crcBufI = Buffer.alloc(2);
+  crcBufI.writeUInt16BE(crcValI, 0);
+  const gt06LoginFrame = Buffer.concat([
     Buffer.from([0x78, 0x78]),
-    hbPayload,
-    crcBufH,
+    payloadI,
+    crcBufI,
     Buffer.from([0x0D, 0x0A]),
   ]);
 
-  stateH.buffer = gt06HeartbeatFrame;
-  _processBuffer(mockSockH, stateH);
+  stateI.buffer = gt06LoginFrame;
+  _processBuffer(mockSockI, stateI);
 
-  assert.strictEqual(mockSockH.written.length, 1, 'Expected GT06 Heartbeat ACK to be written');
-  console.log('✅ Test H Passed!\n');
+  assert.strictEqual(stateI.protocol, 'GT06');
+  const loginLogI = capturedLogs.find((l) => l.event === 'GT06_LOGIN');
+  assert(loginLogI, 'Expected GT06_LOGIN log event');
+  assert.strictEqual(loginLogI.data.imeiHex, '0123456789012340');
+  assert.strictEqual(deviceRegistry.get('0123456789012340'), mockSockI);
+  assert.strictEqual(mockSockI.written.length, 1, 'Expected GT06 Login ACK written to socket');
+
+  // GT06 Heartbeat frame: 78 78 05 13 ...
+  const hbPayloadI = Buffer.from([0x05, 0x13, 0x00, 0x02]);
+  const crcValHb = crc16(hbPayloadI);
+  const crcBufHb = Buffer.alloc(2);
+  crcBufHb.writeUInt16BE(crcValHb, 0);
+  const gt06HbFrame = Buffer.concat([
+    Buffer.from([0x78, 0x78]),
+    hbPayloadI,
+    crcBufHb,
+    Buffer.from([0x0D, 0x0A]),
+  ]);
+
+  stateI.buffer = gt06HbFrame;
+  _processBuffer(mockSockI, stateI);
+  assert.strictEqual(mockSockI.written.length, 2, 'Expected GT06 Heartbeat ACK written');
+
+  // Resync on noise before GT06 frame
+  const noisyBuffer = Buffer.concat([
+    Buffer.from([0xAA, 0xBB, 0xCC]),
+    gt06HbFrame,
+  ]);
+  stateI.buffer = noisyBuffer;
+  _processBuffer(mockSockI, stateI);
+  assert.strictEqual(mockSockI.written.length, 3, 'Expected resync and ACK for heartbeat after noise');
+
+  deviceRegistry.delete('0123456789012340');
+  console.log('✅ Test I Passed!\n');
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST J: Server Graceful Shutdown (closeGt06Server)
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log('Test J: Server graceful shutdown (closeGt06Server)');
+  const mockSockJ = createMockSocket('10.0.0.2', 60002);
+  const stateJ = {
+    protocol: 'HQ',
+    buffer: Buffer.alloc(0),
+    imei: '867232054850999',
+    closeReason: 'remote_tracker_close',
+  };
+  mockSockJ._trackerState = stateJ;
+  deviceRegistry.set('867232054850999', mockSockJ);
+
+  const mockServer = {
+    close: (cb) => { if (cb) cb(); },
+  };
+
+  closeGt06Server(mockServer, 'server_shutdown').then(() => {
+    assert.strictEqual(mockSockJ.isDestroyed, true, 'Active socket should be destroyed on server shutdown');
+    assert.strictEqual(stateJ.closeReason, 'server_shutdown');
+    assert.strictEqual(deviceRegistry.size, 0, 'Registry should be empty after server shutdown');
+    console.log('✅ Test J Passed!\n');
+  });
 
   console.log('🎉 ALL TESTS PASSED SUCCESSFULLY!');
 } finally {
