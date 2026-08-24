@@ -11,9 +11,16 @@ const {
   crc16,
   _processBuffer,
   deviceRegistry,
+  deviceStates,
   registerDevice,
   closeGt06Server,
+  buildCantrackCommand,
+  sendDeviceCommand,
+  getConnectedDevices,
+  getDeviceState,
+  enforceContinuousTracking,
 } = require('../src/gt06Server');
+const { gpsEventEmitter } = require('../src/gpsEvents');
 const { logger } = require('../src/logger');
 
 // Mock socket to capture logs and writes
@@ -85,10 +92,9 @@ function restoreLogs() {
   logger.error = origError;
 }
 
-console.log('Running GT06 & HQ Protocol Automated Tests...\n');
-
-try {
+async function runTests() {
   startCapturingLogs();
+  try {
 
   // ───────────────────────────────────────────────────────────────────────────
   // TEST 0: formatV1Timestamp helper
@@ -175,7 +181,8 @@ try {
   assert(ackLogC, 'Expected HQ_ACK_SENT log event for V0 login');
   assert.strictEqual(ackLogC.data.responseAscii, '*HQ,867232054850970,V0#\r\n');
   assert.strictEqual(ackLogC.data.responseHex, Buffer.from('*HQ,867232054850970,V0#\r\n').toString('hex'));
-  assert.strictEqual(mockSockC.written.length, 1, 'Expected V0 ACK written to socket');
+  assert.strictEqual(mockSockC.written[0], '*HQ,867232054850970,V0#\r\n', 'Expected V0 ACK written to socket');
+  assert(mockSockC.written[1].includes('WKMD'), 'Expected auto-enforce WKMD command sent on login');
   console.log('✅ Test C Passed!\n');
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -258,7 +265,7 @@ try {
   _processBuffer(mockSockG, stateG);
   assert.strictEqual(stateG.protocol, 'HQ');
   assert.strictEqual(deviceRegistry.get('867232054850970'), mockSockG);
-  assert.strictEqual(mockSockG.written.length, 1);
+  assert(mockSockG.written.length >= 1);
   assert.strictEqual(mockSockG.written[0], '*HQ,867232054850970,V0#\r\n');
 
   // Step 2: 6 consecutive V1 updates (representing continuous tracking)
@@ -276,7 +283,7 @@ try {
     assert(lastWritten.includes(ts), `Expected ACK to contain time ${ts}`);
   }
 
-  assert.strictEqual(mockSockG.written.length, 7, 'Expected 1 login ACK + 6 GPS ACKs = 7 total');
+  assert(mockSockG.written.length >= 7, 'Expected login ACK/commands + 6 GPS ACKs');
   assert.strictEqual(mockSockG.isDestroyed, false, 'Socket should remain open and connected');
   console.log('✅ Test G Passed!\n');
 
@@ -479,6 +486,88 @@ try {
   assert.strictEqual(logM_v4.data.cmdConfirmed, 'S2');
   console.log('✅ Test M Passed!\n');
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST O: Cantrack Command Builders (WKMD, D1, S20, R1, S26, S2, S33, S21, S18)
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log('Test O: Cantrack Command Builders');
+  const imeiO = '867232054850970';
+  const fixedTime = '120000';
+
+  const wkmdCmd = buildCantrackCommand(imeiO, 'WKMD', [0], fixedTime);
+  assert.strictEqual(wkmdCmd, `*HQ,${imeiO},WKMD,${fixedTime},0#\r\n`);
+
+  const d1Cmd = buildCantrackCommand(imeiO, 'D1', [30], fixedTime);
+  assert.strictEqual(d1Cmd, `*HQ,${imeiO},D1,${fixedTime},30#\r\n`);
+
+  const cutFuelCmd = buildCantrackCommand(imeiO, 'S20', [1, 3, 10, 3, 5, 5, 7], fixedTime);
+  assert.strictEqual(cutFuelCmd, `*HQ,${imeiO},S20,${fixedTime},1,3,10,3,5,5,7#\r\n`);
+
+  const restoreFuelCmd = buildCantrackCommand(imeiO, 'S20', [1, 0], fixedTime);
+  assert.strictEqual(restoreFuelCmd, `*HQ,${imeiO},S20,${fixedTime},1,0#\r\n`);
+
+  const restartCmd = buildCantrackCommand(imeiO, 'R1', [], fixedTime);
+  assert.strictEqual(restartCmd, `*HQ,${imeiO},R1,${fixedTime}#\r\n`);
+
+  const readStateCmd = buildCantrackCommand(imeiO, 'S26', [0], fixedTime);
+  assert.strictEqual(readStateCmd, `*HQ,${imeiO},S26,${fixedTime},0#\r\n`);
+
+  const centerNumCmd = buildCantrackCommand(imeiO, 'S2', ['08012345678'], fixedTime);
+  assert.strictEqual(centerNumCmd, `*HQ,${imeiO},S2,${fixedTime},08012345678#\r\n`);
+
+  const overspeedCmd = buildCantrackCommand(imeiO, 'S33', [80], fixedTime);
+  assert.strictEqual(overspeedCmd, `*HQ,${imeiO},S33,${fixedTime},80#\r\n`);
+
+  const geofenceCmd = buildCantrackCommand(imeiO, 'S21', [1000, 1], fixedTime);
+  assert.strictEqual(geofenceCmd, `*HQ,${imeiO},S21,${fixedTime},1000,1#\r\n`);
+
+  const alarmModeCmd = buildCantrackCommand(imeiO, 'S18', [1], fixedTime);
+  assert.strictEqual(alarmModeCmd, `*HQ,${imeiO},S18,${fixedTime},1#\r\n`);
+  console.log('✅ Test O Passed!\n');
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST P: sendDeviceCommand & Device State Cache
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log('Test P: sendDeviceCommand & Device State Cache');
+  const mockSockP = createMockSocket('192.168.1.50', 50050);
+  mockSockP._trackerState = { protocol: 'HQ', imei: imeiO };
+  registerDevice(imeiO, mockSockP, 'HQ');
+
+  const emittedGpsEvents = [];
+  const eventHandlerP = (payload) => emittedGpsEvents.push(payload);
+  gpsEventEmitter.on('gps:command_sent', eventHandlerP);
+
+  const resP = await sendDeviceCommand(imeiO, 'WKMD', [0]);
+  assert.strictEqual(resP.success, true);
+  assert.strictEqual(mockSockP.written.length, 1);
+  assert(mockSockP.written[0].startsWith(`*HQ,${imeiO},WKMD,`));
+  assert(mockSockP.written[0].endsWith(',0#\r\n'));
+
+  // Check device state
+  const deviceStateP = getDeviceState(imeiO);
+  assert.strictEqual(deviceStateP.connected, true);
+  assert.strictEqual(deviceStateP.lastCommand.cmd, 'WKMD');
+
+  // Check connected devices list
+  const allDevices = getConnectedDevices();
+  assert(allDevices.some((d) => d.imei === imeiO && d.connected === true));
+
+  // Check event emitter
+  assert(emittedGpsEvents.length > 0);
+  assert.strictEqual(emittedGpsEvents[0].imei, imeiO);
+  assert.strictEqual(emittedGpsEvents[0].cmd, 'WKMD');
+
+  gpsEventEmitter.off('gps:command_sent', eventHandlerP);
+  console.log('✅ Test P Passed!\n');
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST Q: Offline Device sendDeviceCommand
+  // ───────────────────────────────────────────────────────────────────────────
+  console.log('Test Q: Offline device command handling');
+  const resOffline = await sendDeviceCommand('999999999999999', 'R1');
+  assert.strictEqual(resOffline.success, false);
+  assert.strictEqual(resOffline.connected, false);
+  console.log('✅ Test Q Passed!\n');
+
   // Clean registry before shutdown test
   deviceRegistry.clear();
 
@@ -500,14 +589,23 @@ try {
     close: (cb) => { if (cb) cb(); },
   };
 
-  closeGt06Server(mockServer, 'server_shutdown').then(() => {
-    assert.strictEqual(mockSockN.isDestroyed, true, 'Active socket should be destroyed on server shutdown');
-    assert.strictEqual(stateN.closeReason, 'server_shutdown');
-    assert.strictEqual(deviceRegistry.size, 0, 'Registry should be empty after server shutdown');
-    console.log('✅ Test N Passed!\n');
-    console.log('🎉 ALL TESTS PASSED SUCCESSFULLY!');
-  });
-} finally {
-  restoreLogs();
+  await closeGt06Server(mockServer, 'server_shutdown');
+  assert.strictEqual(mockSockN.isDestroyed, true, 'Active socket should be destroyed on server shutdown');
+  assert.strictEqual(stateN.closeReason, 'server_shutdown');
+  assert.strictEqual(deviceRegistry.size, 0, 'Registry should be empty after server shutdown');
+  console.log('✅ Test N Passed!\n');
+
+  console.log('🎉 ALL TESTS PASSED SUCCESSFULLY!');
+  } finally {
+    restoreLogs();
+  }
 }
+
+console.log('Running GT06 & HQ Protocol Automated Tests...\n');
+runTests().catch((err) => {
+  console.error('Test execution failed:', err);
+  process.exit(1);
+});
+
+
 

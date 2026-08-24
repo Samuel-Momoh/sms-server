@@ -12,13 +12,15 @@
  * A single connection always uses one protocol for its lifetime.
  *
  * Environment variables:
- *   GT06_PORT            TCP port to listen on                           (default: 5022)
- *   TCP_KEEPALIVE_DELAY  Initial TCP keepalive delay in ms               (default: 300000)
- *   GPS_RAW_DEBUG        Log raw bytes / ASCII messages                  (default: false)
+ *   GT06_PORT              TCP port to listen on                           (default: 5022)
+ *   TCP_KEEPALIVE_DELAY    Initial TCP keepalive delay in ms               (default: 300000)
+ *   AUTO_ENFORCE_TRACKING  Auto send WKMD 0 and D1 30 on connect           (default: true)
+ *   GPS_RAW_DEBUG          Log raw bytes / ASCII messages                  (default: false)
  */
 
-const net        = require('net');
-const { logger } = require('./logger');
+const net                   = require('net');
+const { logger }            = require('./logger');
+const { gpsEventEmitter }   = require('./gpsEvents');
 
 // Dynamic flag checker for raw debugging
 const isRawDebug = () => process.env.GPS_RAW_DEBUG === 'true';
@@ -27,9 +29,230 @@ const isRawDebug = () => process.env.GPS_RAW_DEBUG === 'true';
 // Accommodates moving (30s) and stationary/sleep intervals (e.g. 180s–300s)
 const getKeepAliveDelay = () => parseInt(process.env.TCP_KEEPALIVE_DELAY, 10) || 300000;
 
+// Flag to auto-enforce continuous Mode 0 & 30s interval on connect/login
+const isAutoEnforceTracking = () => process.env.AUTO_ENFORCE_TRACKING !== 'false';
+
 // ── Device registry: IMEI → socket ───────────────────────────────────────────
-// Lets us push commands or track active connections by IMEI
 const deviceRegistry = new Map();
+
+// ── Device Store & Telemetry Cache: IMEI → telemetry state ───────────────────
+const deviceStates = new Map();
+
+/**
+ * Update and cache the latest device state
+ *
+ * @param {string} imei
+ * @param {object} updates
+ * @returns {object}
+ */
+function updateDeviceState(imei, updates = {}) {
+  if (!imei) return null;
+  const current = deviceStates.get(imei) || {
+    imei,
+    connected: false,
+    protocol: null,
+    remoteAddress: null,
+    remotePort: null,
+    connectedAt: null,
+    lastActivityAt: null,
+    lastLocation: null,
+    vehicleStatus: null,
+    lastCommand: null,
+  };
+  const updated = { ...current, ...updates, updatedAt: new Date().toISOString() };
+  deviceStates.set(imei, updated);
+  return updated;
+}
+
+/**
+ * List all known devices with their current connection status
+ *
+ * @returns {Array<object>}
+ */
+function getConnectedDevices() {
+  const result = [];
+  for (const [imei, state] of deviceStates.entries()) {
+    result.push({
+      ...state,
+      connected: deviceRegistry.has(imei),
+    });
+  }
+  return result;
+}
+
+/**
+ * Get device state by IMEI
+ *
+ * @param {string} imei
+ * @returns {object|null}
+ */
+function getDeviceState(imei) {
+  if (!imei) return null;
+  const state = deviceStates.get(imei);
+  if (!state) return null;
+  return {
+    ...state,
+    connected: deviceRegistry.has(imei),
+  };
+}
+
+// =============================================================================
+// Cantrack GPRS Command Builders & Senders
+// =============================================================================
+
+/**
+ * Build a Cantrack ASCII command string according to Section A.1:
+ * Format: *HQ,<IMEI>,<CMD>,<HHMMSS>,<PARAM1>,<PARAM2>,...#\r\n
+ *
+ * @param {string} imei
+ * @param {string} cmd
+ * @param {Array<string|number>} [params=[]]
+ * @param {string} [timeStr]
+ * @returns {string}
+ */
+function buildCantrackCommand(imei, cmd, params = [], timeStr) {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const hhmmss = timeStr || `${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
+  const paramStr = params && params.length > 0 ? `,${params.join(',')}` : '';
+  return `*HQ,${imei},${cmd},${hhmmss}${paramStr}#\r\n`;
+}
+
+/**
+ * Send a Cantrack command to a connected tracker over TCP
+ *
+ * @param {string} imei
+ * @param {string} commandOrCmd  Command code (e.g. 'WKMD', 'D1', 'S20') OR full raw '*HQ,...#'
+ * @param {Array<string|number>} [params=[]]
+ * @returns {Promise<{ success: boolean, message?: string, error?: string, imei: string, command?: string }>}
+ */
+function sendDeviceCommand(imei, commandOrCmd, params = []) {
+  if (!imei) {
+    return Promise.resolve({ success: false, error: 'IMEI is required', imei });
+  }
+
+  const socket = deviceRegistry.get(imei);
+  if (!socket || socket.destroyed) {
+    return Promise.resolve({
+      success: false,
+      error: `Device ${imei} is not connected or TCP socket is closed`,
+      imei,
+      connected: false,
+    });
+  }
+
+  let commandString = '';
+  let cmdCode = '';
+
+  if (typeof commandOrCmd === 'string' && commandOrCmd.startsWith('*')) {
+    commandString = commandOrCmd.endsWith('\r\n') ? commandOrCmd : (commandOrCmd.endsWith('\n') ? commandOrCmd : `${commandOrCmd}\r\n`);
+    const parts = commandOrCmd.replace(/^\*/, '').replace(/[#\r\n]+$/, '').split(',');
+    cmdCode = parts[2] || 'RAW';
+  } else {
+    cmdCode = commandOrCmd;
+    commandString = buildCantrackCommand(imei, commandOrCmd, params);
+  }
+
+  const hex = Buffer.from(commandString).toString('hex');
+
+  return new Promise((resolve) => {
+    socket.write(commandString, (err) => {
+      if (err) {
+        logger.error('HQ_COMMAND_WRITE_ERROR', {
+          imei,
+          command: commandString.trim(),
+          error: err.message,
+        });
+        return resolve({
+          success: false,
+          error: err.message,
+          imei,
+          command: commandString.trim(),
+        });
+      }
+
+      logger.info('HQ_COMMAND_SENT', {
+        imei,
+        cmd: cmdCode,
+        commandAscii: commandString.trim(),
+        commandHex: hex,
+      });
+
+      gpsEventEmitter.emit('gps:command_sent', {
+        imei,
+        cmd: cmdCode,
+        command: commandString.trim(),
+        hex,
+        timestamp: new Date().toISOString(),
+      });
+
+      updateDeviceState(imei, {
+        lastCommand: {
+          cmd: cmdCode,
+          command: commandString.trim(),
+          sentAt: new Date().toISOString(),
+        },
+      });
+
+      resolve({
+        success: true,
+        imei,
+        cmd: cmdCode,
+        command: commandString.trim(),
+        hex,
+        sentAt: new Date().toISOString(),
+      });
+    });
+  });
+}
+
+/**
+ * Enforce continuous tracking mode (Mode 0) and 30s interval on the tracker.
+ * Prevents the tracker firmware from entering deep sleep when vehicle ACC is off.
+ *
+ * @param {net.Socket} socket
+ * @param {string} imei
+ */
+function enforceContinuousTracking(socket, imei) {
+  if (!isAutoEnforceTracking() || !imei || !socket || socket.destroyed) return;
+
+  const now = Date.now();
+  const trackerState = socket._trackerState || {};
+  // Avoid re-enforcing more frequently than once every 5 minutes
+  if (trackerState.lastEnforceAt && (now - trackerState.lastEnforceAt < 5 * 60 * 1000)) {
+    return;
+  }
+
+  trackerState.lastEnforceAt = now;
+
+  // Step 1: Set Working Mode to 0 (GPS Real-time Tracking, GPS kept open)
+  const wkmdCmd = buildCantrackCommand(imei, 'WKMD', ['0']);
+  socket.write(wkmdCmd, () => {
+    logger.info('HQ_AUTO_ENFORCE_WKMD', {
+      imei,
+      mode: '0 (GPS Real-time Tracking)',
+      command: wkmdCmd.trim(),
+    });
+  });
+
+  // Step 2: Set GPRS reporting interval to 30 seconds
+  setTimeout(() => {
+    if (socket && !socket.destroyed) {
+      const d1Cmd = buildCantrackCommand(imei, 'D1', ['30']);
+      socket.write(d1Cmd, () => {
+        logger.info('HQ_AUTO_ENFORCE_INTERVAL', {
+          imei,
+          intervalSeconds: 30,
+          command: d1Cmd.trim(),
+        });
+      });
+    }
+  }, 1000);
+}
+
+// =============================================================================
+// HQ Timestamp & NMEA Helpers
+// =============================================================================
 
 // Helper to convert V1/V2 packet's HHMMSS into YYYYMMDDHHMMSS
 // Uses packet's DDMMYY dateRaw if provided, falling back to today's UTC date
@@ -173,6 +396,14 @@ function registerDevice(imei, socket, protocol, state) {
       action: 'replacing_previous_connection',
     });
 
+    gpsEventEmitter.emit('gps:reconnected', {
+      imei,
+      protocol: protocol || trackerState.protocol || 'unknown',
+      oldRemote,
+      newRemote,
+      timestamp: new Date().toISOString(),
+    });
+
     try {
       if (existingSocket._trackerState) {
         existingSocket._trackerState.closeReason = 'replaced_by_new_connection';
@@ -185,6 +416,22 @@ function registerDevice(imei, socket, protocol, state) {
   }
 
   deviceRegistry.set(imei, socket);
+
+  updateDeviceState(imei, {
+    connected: true,
+    protocol: protocol || trackerState.protocol || 'unknown',
+    remoteAddress: socket.remoteAddress,
+    remotePort: socket.remotePort,
+    connectedAt: trackerState.connectedAt || new Date().toISOString(),
+    lastActivityAt: trackerState.lastActivityAt,
+  });
+
+  gpsEventEmitter.emit('gps:connected', {
+    imei,
+    protocol: protocol || trackerState.protocol || 'unknown',
+    remote: `${socket.remoteAddress}:${socket.remotePort}`,
+    timestamp: new Date().toISOString(),
+  });
 }
 
 // =============================================================================
@@ -254,6 +501,13 @@ function handleGt06Login(socket, data, state) {
     imeiHex,
   });
 
+  gpsEventEmitter.emit('gps:login', {
+    imei: imeiHex,
+    protocol: 'GT06',
+    remote: `${socket.remoteAddress}:${socket.remotePort}`,
+    timestamp: new Date().toISOString(),
+  });
+
   const ack = buildAck(0x01, serialNo);
   socket.write(ack, (err) => {
     if (err) {
@@ -267,6 +521,13 @@ function handleGt06Login(socket, data, state) {
   logger.info('GT06_ACK_SENT', {
     protocol: '0x01 (login)',
     remote:   `${socket.remoteAddress}:${socket.remotePort}`,
+  });
+
+  gpsEventEmitter.emit('gps:ack_sent', {
+    imei: imeiHex,
+    protocol: 'GT06',
+    type: '0x01 (login)',
+    timestamp: new Date().toISOString(),
   });
 }
 
@@ -298,16 +559,43 @@ function handleGt06Location(socket, data, protocolNumber, state) {
 
   const pad = (n) => String(n).padStart(2, '0');
   const timestamp = `20${pad(year)}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}:${pad(second)} UTC`;
+  const latitude = parseFloat(lat.toFixed(6));
+  const longitude = parseFloat(lon.toFixed(6));
+  const imei = (state && state.imei) || (socket._trackerState && socket._trackerState.imei) || null;
 
   logger.info('GT06_GPS_UPDATE', {
     remote:    `${socket.remoteAddress}:${socket.remotePort}`,
     protocol:  `0x${protocolNumber.toString(16).toUpperCase()}`,
-    lat:       parseFloat(lat.toFixed(6)),
-    lon:       parseFloat(lon.toFixed(6)),
+    imei:      imei || undefined,
+    lat:       latitude,
+    lon:       longitude,
     speed_kmh: speed,
     gpsFixed:  isGpsRealtime,
     timestamp,
   });
+
+  if (imei) {
+    updateDeviceState(imei, {
+      lastLocation: {
+        latitude,
+        longitude,
+        speed_kmh: speed,
+        gpsFixed: isGpsRealtime,
+        timestamp,
+      },
+      lastActivityAt: new Date().toISOString(),
+    });
+
+    gpsEventEmitter.emit('gps:update', {
+      imei,
+      protocol: 'GT06',
+      latitude,
+      longitude,
+      speed_kmh: speed,
+      gpsFixed: isGpsRealtime,
+      timestamp,
+    });
+  }
 }
 
 function handleGt06Heartbeat(socket, data, state) {
@@ -315,7 +603,9 @@ function handleGt06Heartbeat(socket, data, state) {
   else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
 
   const serialNo = data.subarray(data.length - 6, data.length - 4);
-  const ack      = buildAck(0x13, serialNo);
+  const imei = (state && state.imei) || (socket._trackerState && socket._trackerState.imei) || null;
+
+  const ack = buildAck(0x13, serialNo);
   socket.write(ack, (err) => {
     if (err) {
       logger.error('GT06_WRITE_ERROR', {
@@ -329,6 +619,14 @@ function handleGt06Heartbeat(socket, data, state) {
     protocol: '0x13 (heartbeat)',
     remote:   `${socket.remoteAddress}:${socket.remotePort}`,
   });
+
+  if (imei) {
+    gpsEventEmitter.emit('gps:heartbeat', {
+      imei,
+      protocol: 'GT06',
+      timestamp: new Date().toISOString(),
+    });
+  }
 }
 
 function handleGt06Packet(socket, frame, state) {
@@ -367,17 +665,6 @@ function handleGt06Packet(socket, frame, state) {
 // HQ — Coordinate Conversion (DDMM.MMMM / DDDMM.MMMM -> Decimal Degrees)
 // =============================================================================
 
-/**
- * Convert NMEA coordinate string to decimal degrees.
- *
- * The decimal point is always preceded by exactly 2 minute digits:
- *   "0453.2956", "N"  -> 04 deg + 53.2956/60 = 4.888260
- *   "00654.7924", "E" -> 006 deg + 54.7924/60 = 6.913207
- *
- * @param {string} nmea       Raw NMEA coordinate string
- * @param {string} hemisphere 'N' | 'S' | 'E' | 'W'
- * @returns {number} Decimal degrees (negative for S / W)
- */
 function nmeaToDecimal(nmea, hemisphere) {
   if (!nmea || typeof nmea !== 'string') return NaN;
   const dotIdx = nmea.indexOf('.');
@@ -404,19 +691,6 @@ function nmeaToDecimal(nmea, hemisphere) {
 // HQ / H02 / A3 — ACK Builder
 // =============================================================================
 
-/**
- * Build HQ / H02 / A3 protocol ACK response packet.
- *
- * Formats:
- *   - V1 GPS confirmation (V4): *HQ,<IMEI>,V4,V1,<YYYYMMDDHHMMSS>#\r\n
- *   - V0 Login confirmation:    *HQ,<IMEI>,V0#\r\n
- *   - Heartbeat confirmation:   *HQ,<IMEI>,HTBT#\r\n
- *
- * @param {string} imei         Device IMEI / ID
- * @param {string} cmd          Command being acknowledged ('V1', 'V0', 'HTBT')
- * @param {string} [timestamp]  YYYYMMDDHHMMSS timestamp (derived from packet HHMMSS + UTC date)
- * @returns {string}
- */
 function buildHqAck(imei, cmd, timestamp) {
   if (cmd === 'V1' || cmd === 'V2') {
     const ts = timestamp || formatV1Timestamp();
@@ -435,14 +709,6 @@ function buildHqAck(imei, cmd, timestamp) {
 // HQ — Socket Safe Write Helper
 // =============================================================================
 
-/**
- * Sends response to the tracker over TCP, checks write callback/error,
- * and logs the exact ASCII and hex bytes sent.
- *
- * @param {net.Socket} socket
- * @param {string}     imei
- * @param {string}     ackResponse
- */
 function sendHqResponse(socket, imei, ackResponse) {
   const hex = Buffer.from(ackResponse).toString('hex');
 
@@ -465,20 +731,20 @@ function sendHqResponse(socket, imei, ackResponse) {
     responseAscii: ackResponse,
     responseHex:   hex,
   });
+
+  gpsEventEmitter.emit('gps:ack_sent', {
+    imei,
+    protocol: 'HQ',
+    responseAscii: ackResponse,
+    responseHex: hex,
+    timestamp: new Date().toISOString(),
+  });
 }
 
 // =============================================================================
 // HQ — Message Parser (pure function)
 // =============================================================================
 
-/**
- * Parse an HQ message string.
- *
- * Handles optional leading '*', trailing '#', '\r', '\n', and trailing commas.
- *
- * @param {string} message
- * @returns {{ imei: string, cmd: string, fields: string[] } | null}
- */
 function parseHqMessage(message) {
   if (!message || typeof message !== 'string') return null;
 
@@ -514,8 +780,18 @@ function handleHqLogin(socket, imei, fields, state) {
     remote:   `${socket.remoteAddress}:${socket.remotePort}`,
   });
 
+  gpsEventEmitter.emit('gps:login', {
+    imei,
+    protocol: 'HQ',
+    remote: `${socket.remoteAddress}:${socket.remotePort}`,
+    timestamp: new Date().toISOString(),
+  });
+
   const ack = buildHqAck(imei, 'V0');
   sendHqResponse(socket, imei, ack);
+
+  // Auto-enforce continuous Mode 0 and 30s interval to prevent 30-min idle sleep
+  enforceContinuousTracking(socket, imei);
 }
 
 function handleHqGps(socket, imei, fields, state, cmd = 'V1') {
@@ -555,7 +831,7 @@ function handleHqGps(socket, imei, fields, state, cmd = 'V1') {
   const direction     = directionRaw ? parseInt(directionRaw, 10) || 0 : 0;
   const vehicleStatus = parseEquStatus(equStatusRaw);
 
-  logger.info('HQ_GPS_UPDATE', {
+  const payload = {
     event:           'HQ_GPS_UPDATE',
     protocol:        'HQ',
     cmd,
@@ -574,12 +850,39 @@ function handleHqGps(socket, imei, fields, state, cmd = 'V1') {
     isOilCut:        vehicleStatus.isOilCut,
     equStatusHex:    equStatusRaw || undefined,
     timestamp,
+  };
+
+  logger.info('HQ_GPS_UPDATE', payload);
+
+  updateDeviceState(imei, {
+    lastLocation: {
+      latitude,
+      longitude,
+      speed_kmh: speedKmh,
+      speed_knots: validKnots,
+      direction,
+      gpsStatus,
+      timestamp,
+    },
+    vehicleStatus,
+    lastActivityAt: new Date().toISOString(),
   });
+
+  gpsEventEmitter.emit('gps:update', payload);
 
   // Respond immediately with H02/A3 V4 confirmation response: *HQ,<IMEI>,V4,V1,<YYYYMMDDHHMMSS>#\r\n
   const v4Timestamp = formatV1Timestamp(timeRaw, dateRaw);
   const ack = buildHqAck(imei, cmd, v4Timestamp);
   sendHqResponse(socket, imei, ack);
+
+  // Periodic keep-awake re-assertion if ACC is OFF (preventing 30-min idle sleep)
+  if (!vehicleStatus.accOn) {
+    const trackerState = socket._trackerState || {};
+    const now = Date.now();
+    if (!trackerState.lastEnforceAt || (now - trackerState.lastEnforceAt > 15 * 60 * 1000)) {
+      enforceContinuousTracking(socket, imei);
+    }
+  }
 }
 
 function handleHqHeartbeat(socket, imei, fields, state) {
@@ -593,6 +896,13 @@ function handleHqHeartbeat(socket, imei, fields, state) {
     remote:   `${socket.remoteAddress}:${socket.remotePort}`,
   });
 
+  gpsEventEmitter.emit('gps:heartbeat', {
+    imei,
+    protocol: 'HQ',
+    remote: `${socket.remoteAddress}:${socket.remotePort}`,
+    timestamp: new Date().toISOString(),
+  });
+
   // Respond with HQ Heartbeat ACK: *HQ,<IMEI>,HTBT#\r\n
   const ack = buildHqAck(imei, 'HTBT');
   sendHqResponse(socket, imei, ack);
@@ -602,32 +912,58 @@ function handleHqLbs(socket, imei, fields, state) {
   if (state) state.lastActivityAt = new Date().toISOString();
   else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
 
-  // V3 Format: HHMMSS, Base_Info (MCC, MNC, Base_Number, LAC1, Cell_ID1, ...), Battery_Info, Failure_Info, Cont, DDMMYY, equ_status
   const [timeRaw, ...rest] = fields;
-  logger.info('HQ_LBS_UPDATE', {
+  const payload = {
     event:    'HQ_LBS_UPDATE',
     protocol: 'HQ',
     imei,
     remote:   `${socket.remoteAddress}:${socket.remotePort}`,
     timeRaw,
     details:  rest,
-  });
+    timestamp: new Date().toISOString(),
+  };
+
+  logger.info('HQ_LBS_UPDATE', payload);
+  gpsEventEmitter.emit('gps:lbs', payload);
 }
 
 function handleHqConfirm(socket, imei, fields, state) {
   if (state) state.lastActivityAt = new Date().toISOString();
   else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
 
-  // V4 confirm response from device for server command (e.g. S1, S2, S20, etc.)
   const [cmdConfirmed, ...rest] = fields;
-  logger.info('HQ_COMMAND_CONFIRM', {
+  const payload = {
     event:        'HQ_COMMAND_CONFIRM',
     protocol:     'HQ',
     imei,
     remote:       `${socket.remoteAddress}:${socket.remotePort}`,
     cmdConfirmed,
     details:      rest,
-  });
+    timestamp:    new Date().toISOString(),
+  };
+
+  logger.info('HQ_COMMAND_CONFIRM', payload);
+  gpsEventEmitter.emit('gps:confirm', payload);
+}
+
+function handleHqWifi(socket, imei, fields, state) {
+  if (state) state.lastActivityAt = new Date().toISOString();
+  else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
+
+  const [timeRaw, wifiCount, ...rest] = fields;
+  const payload = {
+    event:     'HQ_WIFI_UPDATE',
+    protocol:  'HQ',
+    imei,
+    remote:    `${socket.remoteAddress}:${socket.remotePort}`,
+    timeRaw,
+    wifiCount: parseInt(wifiCount, 10) || 0,
+    details:   rest,
+    timestamp: new Date().toISOString(),
+  };
+
+  logger.info('HQ_WIFI_UPDATE', payload);
+  gpsEventEmitter.emit('gps:wifi', payload);
 }
 
 function handleHqPacket(socket, message, state) {
@@ -636,6 +972,11 @@ function handleHqPacket(socket, message, state) {
       remote: `${socket.remoteAddress}:${socket.remotePort}`,
       ascii:  message,
       hex:    Buffer.from(message).toString('hex'),
+    });
+    gpsEventEmitter.emit('gps:raw', {
+      ascii: message,
+      hex: Buffer.from(message).toString('hex'),
+      remote: `${socket.remoteAddress}:${socket.remotePort}`,
     });
   }
 
@@ -666,6 +1007,9 @@ function handleHqPacket(socket, message, state) {
     case 'V4':
       handleHqConfirm(socket, imei, fields, state);
       break;
+    case 'V5':
+      handleHqWifi(socket, imei, fields, state);
+      break;
     case 'HTBT':
       handleHqHeartbeat(socket, imei, fields, state);
       break;
@@ -685,7 +1029,6 @@ function handleHqPacket(socket, message, state) {
 function processGt06Buffer(socket, state) {
   while (state.buffer.length >= 4) {
     if (state.buffer[0] !== 0x78 || state.buffer[1] !== 0x78) {
-      // Find next 0x78 0x78 in buffer
       let nextSync = -1;
       for (let i = 1; i < state.buffer.length - 1; i++) {
         if (state.buffer[i] === 0x78 && state.buffer[i + 1] === 0x78) {
@@ -725,18 +1068,15 @@ function processGt06Buffer(socket, state) {
 
 function processHqBuffer(socket, state) {
   while (state.buffer.length > 0) {
-    // If buffer does not start with '*', search for next '*'
     if (state.buffer[0] !== 0x2a /* '*' */) {
       const nextStar = state.buffer.indexOf(0x2a);
       if (nextStar === -1) {
-        // No '*' found in entire buffer
         state.buffer = Buffer.alloc(0);
         break;
       }
       state.buffer = state.buffer.subarray(nextStar);
     }
 
-    // Look for packet terminator: '#', '\n', or next '*HQ,' starting after index 0
     let endIdx  = -1;
     let endType = null;
 
@@ -752,7 +1092,6 @@ function processHqBuffer(socket, state) {
         endType = 'newline';
         break;
       }
-      // Check if another '*HQ,' starts at i > 0
       if (i > 0 && b === 0x2a && state.buffer.subarray(i, i + 4).toString() === '*HQ,') {
         endIdx  = i;
         endType = 'next_hq';
@@ -761,7 +1100,6 @@ function processHqBuffer(socket, state) {
     }
 
     if (endIdx === -1) {
-      // Incomplete packet in stream, wait for further TCP chunks
       break;
     }
 
@@ -794,7 +1132,6 @@ function processHqBuffer(socket, state) {
 }
 
 function processBuffer(socket, state) {
-  // Protocol detection on initial chunk(s)
   if (!state.protocol) {
     if (state.buffer.length < 4) return;
 
@@ -814,7 +1151,6 @@ function processBuffer(socket, state) {
         remote: `${socket.remoteAddress}:${socket.remotePort}`,
       });
     } else {
-      // Resynchronize by finding next valid header
       let nextGt06 = -1;
       let nextHq   = -1;
 
@@ -885,7 +1221,7 @@ function createGt06Server(port) {
     // Explicitly disable inactivity timeout so Node never abruptly terminates long-lived connections
     socket.setTimeout(0);
 
-    // Keepalive initial delay: defaults to 60s (or TCP_KEEPALIVE_DELAY), higher than 30s reporting intervals
+    // Keepalive initial delay: defaults to 5 minutes (or TCP_KEEPALIVE_DELAY)
     socket.setKeepAlive(true, getKeepAliveDelay());
     socket.setNoDelay(true);
 
@@ -933,10 +1269,15 @@ function createGt06Server(port) {
         if (deviceRegistry.get(state.imei) === socket) {
           deviceRegistry.delete(state.imei);
         }
+        updateDeviceState(state.imei, {
+          connected: false,
+          lastActivityAt: new Date().toISOString(),
+        });
       } else {
         for (const [imei, sock] of deviceRegistry.entries()) {
           if (sock === socket) {
             deviceRegistry.delete(imei);
+            updateDeviceState(imei, { connected: false });
           }
         }
       }
@@ -960,7 +1301,7 @@ function createGt06Server(port) {
 
       const durationMs = Date.now() - new Date(state.connectedAt).getTime();
 
-      logger.info('DEVICE_DISCONNECTED', {
+      const disconnectPayload = {
         remote:         `${socket.remoteAddress}:${socket.remotePort}`,
         protocol:       state.protocol || 'unknown',
         imei:           state.imei || undefined,
@@ -972,7 +1313,13 @@ function createGt06Server(port) {
         durationMs,
         connectedAt:    state.connectedAt,
         lastActivityAt: state.lastActivityAt,
-      });
+      };
+
+      logger.info('DEVICE_DISCONNECTED', disconnectPayload);
+
+      if (state.imei) {
+        gpsEventEmitter.emit('gps:disconnected', disconnectPayload);
+      }
     });
   });
 
@@ -1033,8 +1380,14 @@ module.exports = {
   sendHqResponse,
   handleHqPacket,
   handleGt06Packet,
+  buildCantrackCommand,
+  sendDeviceCommand,
+  enforceContinuousTracking,
+  getConnectedDevices,
+  getDeviceState,
   _processBuffer:     processBuffer,
   _processHqBuffer:   processHqBuffer,
   _processGt06Buffer: processGt06Buffer,
   deviceRegistry,
+  deviceStates,
 };
