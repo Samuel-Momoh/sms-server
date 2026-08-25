@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { logger } = require('./logger');
 
@@ -7,15 +8,51 @@ const JWT_SECRET = process.env.JWT_SECRET || 'tracker-admin-jwt-secret-key-2026'
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '24h';
 
 /**
- * Generate a signed JWT token for the authenticated admin user.
+ * Hash a plaintext password with a random salt using crypto.scrypt.
+ */
+function hashPassword(password) {
+  if (!password || typeof password !== 'string') {
+    throw new Error('Password must be a non-empty string');
+  }
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derivedKey = crypto.scryptSync(password, salt, 64);
+  return `${salt}:${derivedKey.toString('hex')}`;
+}
+
+/**
+ * Verify a plaintext password against a stored salt:hash string.
+ */
+function verifyPassword(password, storedHash) {
+  if (!password || !storedHash || typeof storedHash !== 'string') {
+    return false;
+  }
+  const parts = storedHash.split(':');
+  if (parts.length !== 2) {
+    // If legacy plain-text password matches
+    return password === storedHash;
+  }
+  const [salt, key] = parts;
+  try {
+    const derivedKey = crypto.scryptSync(password, salt, 64);
+    const keyBuffer = Buffer.from(key, 'hex');
+    return crypto.timingSafeEqual(derivedKey, keyBuffer);
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Generate a signed JWT token for the authenticated user.
  */
 function generateToken(payload = {}) {
   const adminUser = process.env.ADMIN_USER || process.env.GATEWAY_USERNAME || 'admin';
   return jwt.sign(
     {
-      sub: payload.username || adminUser,
+      sub: payload.id || payload.username || adminUser,
+      id: payload.id,
       username: payload.username || adminUser,
-      role: 'admin',
+      role: payload.role || 'user',
+      name: payload.name,
       ...payload,
     },
     JWT_SECRET,
@@ -35,18 +72,7 @@ function verifyToken(token) {
 }
 
 /**
- * Admin Authentication Middleware for GPS REST API endpoints.
- *
- * Checks credentials against environment variables:
- *   - ADMIN_USER (fallback: GATEWAY_USERNAME || 'admin')
- *   - ADMIN_PWD  (fallback: GATEWAY_PASSWORD || 'secret')
- *
- * Supported Authentication Methods:
- *   1. JWT Bearer Token: Authorization: Bearer <jwt_token>
- *   2. HTTP Basic Auth: Authorization: Basic <base64(username:password)>
- *   3. Legacy Bearer Token: Authorization: Bearer <password> or <username:password>
- *   4. Custom Headers: x-admin-user and x-admin-pwd, or x-api-key
- *   5. Query / Body Parameters: admin_user / admin_pwd, adminUser / adminPassword
+ * Authentication Middleware for GPS REST API endpoints.
  */
 function adminAuth(req, res, next) {
   const adminUser = process.env.ADMIN_USER || process.env.GATEWAY_USERNAME || 'admin';
@@ -130,8 +156,29 @@ function adminAuth(req, res, next) {
 
   return res.status(401).json({
     success: false,
-    error: 'Unauthorized: Admin login required. Provide Authorization: Bearer <token> or HTTP Basic Auth.',
+    error: 'Unauthorized: Authentication required. Provide Authorization: Bearer <token>.',
   });
 }
 
-module.exports = { adminAuth, generateToken, verifyToken, JWT_SECRET };
+/**
+ * Middleware requiring 'admin' role.
+ */
+function requireAdmin(req, res, next) {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden: Admin privilege required for this operation',
+    });
+  }
+  next();
+}
+
+module.exports = {
+  adminAuth,
+  requireAdmin,
+  generateToken,
+  verifyToken,
+  hashPassword,
+  verifyPassword,
+  JWT_SECRET,
+};

@@ -7,7 +7,7 @@
     "dev": "node --watch index.js",
     "gt06:test": "node test/gt06-simulator.js",
     "hq:test": "node test/hq-simulator.js",
-    "test": "node test/gt06-hq.test.js && node test/gps-api-ws.test.js"
+    "test": "node test/gt06-hq.test.js && node test/gps-api-ws.test.js && node test/command-queue.test.js"
   },
   "keywords": [],
   "author": "",
@@ -17,7 +17,9 @@
     "axios": "^1.19.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.3",
+    "mysql2": "^3.24.2",
     "socket.io": "^4.8.3",
     "swagger-ui-express": "^5.0.1"
   },

@@ -8,6 +8,8 @@ const { normalizePhone }    = require('./src/normalizePhone');
 const { logger }            = require('./src/logger');
 const { createGt06Server, closeGt06Server } = require('./src/gt06Server');
 const { initWebSocketServer } = require('./src/wsServer');
+const { initMysql }           = require('./src/db/mysql');
+const { initRedis }           = require('./src/db/redis');
 const gpsRoutes             = require('./src/gpsRoutes');
 
 const app  = express();
@@ -60,6 +62,8 @@ const swaggerSpec = {
     { name: 'GPS Auth', description: 'Admin authentication for GPS management APIs' },
     { name: 'GPS Devices', description: 'Query connected devices and telemetry states (Admin Auth Required)' },
     { name: 'GPS Commands (Cantrack A/3)', description: 'Send GPRS control commands to online GPS trackers over TCP (Admin Auth Required)' },
+    { name: 'GPS Command Queue', description: 'Manage offline command queue for sleeping/disconnected trackers' },
+    { name: 'GPS History', description: 'Retrieve historical trajectory and command logs from MySQL' },
     { name: 'SMS Gateway', description: 'Send SMS via Infobip' },
   ],
   components: {
@@ -103,11 +107,11 @@ const swaggerSpec = {
     },
 
     // ── GPS Auth ──────────────────────────────────────────────────────────────
-    '/api/gps/auth/login': {
+    '/api/gps/auth/register': {
       post: {
         tags: ['GPS Auth'],
-        summary: 'Admin Login',
-        description: 'Validates admin credentials and returns a signed JWT token to pass as `Authorization: Bearer <token>`.',
+        summary: 'Register New User (Email & Password)',
+        description: 'Creates a new user account with email and password and immediately returns a signed JWT Bearer token.',
         security: [],
         requestBody: {
           required: true,
@@ -115,48 +119,60 @@ const swaggerSpec = {
             'application/json': {
               schema: {
                 type: 'object',
-                required: ['username', 'password'],
+                required: ['email', 'password'],
                 properties: {
-                  username: { type: 'string', example: 'admin' },
-                  password: { type: 'string', example: 'secret' },
+                  email: { type: 'string', example: 'driver_john@example.com' },
+                  password: { type: 'string', example: 'securePassword123' },
+                  name: { type: 'string', example: 'John Doe' },
+                  phone: { type: 'string', example: '+2348011223344' },
                 },
               },
             },
           },
         },
         responses: {
-          200: {
-            description: 'Authenticated successfully with JWT token',
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  properties: {
-                    success: { type: 'boolean', example: true },
-                    message: { type: 'string', example: 'Admin authenticated successfully' },
-                    token: { type: 'string', example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...' },
-                    auth: {
-                      type: 'object',
-                      properties: {
-                        type: { type: 'string', example: 'Bearer' },
-                        token: { type: 'string' },
-                        header: { type: 'string', example: 'Bearer eyJhbGci...' },
-                        expiresIn: { type: 'string', example: '24h' },
-                      },
-                    },
-                    user: {
-                      type: 'object',
-                      properties: {
-                        username: { type: 'string', example: 'admin' },
-                        role: { type: 'string', example: 'admin' },
-                      },
-                    },
-                  },
+          201: { description: 'User registered successfully with JWT Bearer token' },
+          400: { description: 'Invalid input or email already exists' },
+        },
+      },
+    },
+
+    '/api/gps/auth/login': {
+      post: {
+        tags: ['GPS Auth'],
+        summary: 'User & Admin Login',
+        description: 'Authenticates user with email and password and returns a signed JWT token.',
+        security: [],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['email', 'password'],
+                properties: {
+                  email: { type: 'string', example: 'driver_john@example.com' },
+                  password: { type: 'string', example: 'securePassword123' },
                 },
               },
             },
           },
+        },
+        responses: {
+          200: { description: 'Authenticated successfully' },
           401: { description: 'Invalid credentials' },
+        },
+      },
+    },
+
+    '/api/gps/auth/me': {
+      get: {
+        tags: ['GPS Auth'],
+        summary: 'Current User Profile',
+        description: 'Returns the currently authenticated user profile from the JWT token.',
+        responses: {
+          200: { description: 'User profile retrieved successfully' },
+          401: { description: 'Unauthorized' },
         },
       },
     },
@@ -170,12 +186,47 @@ const swaggerSpec = {
         responses: {
           200: {
             description: 'List of devices',
-            content: { 'application/json': { schema: { type: 'object', properties: {
-              success: { type: 'boolean', example: true },
-              count:   { type: 'number', example: 1 },
-              devices: { type: 'array', items: { type: 'object' } },
-            }}}},
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: true },
+                    count:   { type: 'number', example: 1 },
+                    devices: { type: 'array', items: { type: 'object' } },
+                  },
+                },
+              },
+            },
           },
+        },
+      },
+      post: {
+        tags: ['GPS Devices'],
+        summary: 'Register New Device',
+        description: 'Registers a new GPS tracking hardware with vehicle and SIM metadata.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['imei'],
+                properties: {
+                  imei: { type: 'string', example: '867232054850970' },
+                  name: { type: 'string', example: 'Toyota Camry - Samuel' },
+                  plateNumber: { type: 'string', example: 'LAG-123AA' },
+                  simNumber: { type: 'string', example: '+2348012345678' },
+                  model: { type: 'string', example: 'Cantrack G02' },
+                  icon: { type: 'string', example: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M18.92 6.01C18.72 5.42 18.16 5 17.5 5h-11c-.66 0-1.21.42-1.42 1.01L3 12v8c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1h12v1c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-8l-2.08-5.99zM6.5 16c-.83 0-1.5-.67-1.5-1.5S5.67 13 6.5 13s1.5.67 1.5 1.5S7.33 16 6.5 16zm11 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zM5 11l1.5-4.5h11L19 11H5z"/></svg>', description: 'Optional SVG string for custom vehicle/tracker icon' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          201: { description: 'Device registered successfully' },
+          400: { description: 'Invalid IMEI or request data' },
         },
       },
     },
@@ -189,6 +240,81 @@ const swaggerSpec = {
         responses: {
           200: { description: 'Device details found' },
           404: { description: 'Device not found in registry' },
+        },
+      },
+      put: {
+        tags: ['GPS Devices'],
+        summary: 'Update Device Metadata & Icon',
+        description: 'Updates device vehicle name, plate number, SIM number, model, and optional SVG icon.',
+        parameters: [
+          { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970' },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string', example: 'Toyota Camry 2024' },
+                  plateNumber: { type: 'string', example: 'LAG-999ZZ' },
+                  simNumber: { type: 'string', example: '+2348099887766' },
+                  model: { type: 'string', example: 'Cantrack G02' },
+                  icon: { type: 'string', example: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>', description: 'Optional SVG markup string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Device updated successfully' },
+          404: { description: 'Device not found' },
+        },
+      },
+      delete: {
+        tags: ['GPS Devices'],
+        summary: 'Delete Device & Permanently Purge All Records',
+        description: 'Permanently unregisters device and deletes all associated records (location history, command logs, Redis queue, memory state).',
+        parameters: [
+          { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970' },
+        ],
+        responses: {
+          200: { description: 'Device and all records purged successfully' },
+          403: { description: 'Forbidden' },
+          404: { description: 'Device not found' },
+        },
+      },
+    },
+
+    // ── GPS Telemetry Simulation ──────────────────────────────────────────────
+    '/api/gps/simulate': {
+      post: {
+        tags: ['GPS Simulation & Testing'],
+        summary: 'Simulate Car Ignition ON & Driving Telemetry',
+        description: 'Simulates real-time vehicle ignition ON / driving telemetry with realistic GPS coordinates, speed, heading, and triggers automatic queue flushing for testing.',
+        requestBody: {
+          required: false,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  imei: { type: 'string', example: '867232054850970', description: 'Tracker IMEI' },
+                  accOn: { type: 'boolean', default: true, example: true, description: 'Simulate engine/ignition status (true = ON/Driving, false = OFF/Parked)' },
+                  speed: { type: 'number', default: 42.5, example: 42.5, description: 'Vehicle speed in km/h' },
+                  latitude: { type: 'number', default: 4.888188, example: 4.888188, description: 'GPS Latitude (Port Harcourt, Nigeria)' },
+                  longitude: { type: 'number', default: 6.913182, example: 6.913182, description: 'GPS Longitude' },
+                  direction: { type: 'number', default: 170, example: 170, description: 'Compass heading in degrees' },
+                  batteryLevel: { type: 'number', default: 100, example: 100 },
+                  steps: { type: 'number', default: 1, example: 5, description: 'Number of driving points to generate' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Telemetry simulated, saved to MySQL, and broadcasted to WebSockets' },
+          403: { description: 'Forbidden (Non-admin attempting to simulate on another user device)' },
         },
       },
     },
@@ -804,6 +930,10 @@ const httpServer = http.createServer(app);
 
 // Initialize Socket.IO WebSocket Server
 const io = initWebSocketServer(httpServer);
+
+// Initialize Database & Redis Services
+initMysql();
+initRedis();
 
 httpServer.listen(PORT, () => {
   logger.info('SERVER_STARTED', {

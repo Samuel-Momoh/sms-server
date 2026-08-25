@@ -1,0 +1,840 @@
+const mysql = require('mysql2/promise');
+const { logger } = require('../logger');
+const { hashPassword } = require('../adminAuth');
+
+let pool = null;
+let isConnected = false;
+
+// In-memory user & device fallback store when MySQL is offline
+const memoryUsers = new Map();
+const memoryDevices = new Map();
+
+/**
+ * Initialize MySQL connection pool, ensure required tables exist, and seed default admin.
+ */
+async function initMysql() {
+  const host = process.env.DATABASE_HOST;
+  const port = parseInt(process.env.DATABASE_PORT || '3306', 10);
+  const user = process.env.DATABASE_USER;
+  const password = process.env.DATABASE_PWD;
+  const database = process.env.DATABASE_NAME;
+
+  if (!host || !user || !database) {
+    logger.warn('MYSQL_CONFIG_MISSING', {
+      message: 'DATABASE_HOST, DATABASE_USER, or DATABASE_NAME not set. MySQL persistence disabled.',
+    });
+    seedMemoryAdmin();
+    return null;
+  }
+
+  try {
+    pool = mysql.createPool({
+      host,
+      port,
+      user,
+      password,
+      database,
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0,
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 10000,
+    });
+
+    // Test connection
+    const connection = await pool.getConnection();
+    isConnected = true;
+    connection.release();
+
+    logger.info('MYSQL_CONNECTED', {
+      host,
+      port,
+      database,
+      user,
+      message: 'MySQL connection established successfully.',
+    });
+
+    await ensureTablesExist();
+    await seedDefaultAdmin();
+    return pool;
+  } catch (err) {
+    isConnected = false;
+    logger.error('MYSQL_CONNECTION_ERROR', {
+      host,
+      port,
+      database,
+      error: err.message,
+      message: 'Failed to connect to MySQL database. Server will continue with in-memory caching.',
+    });
+    seedMemoryAdmin();
+    return null;
+  }
+}
+
+/**
+ * Seed default admin into in-memory store when MySQL is offline.
+ */
+function seedMemoryAdmin() {
+  const adminUser = process.env.ADMIN_USER || process.env.GATEWAY_USERNAME || 'momohofficial@gmail.com';
+  const adminPwd  = process.env.ADMIN_PWD  || process.env.GATEWAY_PASSWORD || '@Samuel196';
+  memoryUsers.set(adminUser.toLowerCase(), {
+    id: 1,
+    username: adminUser.toLowerCase(),
+    password_hash: hashPassword(adminPwd),
+    name: 'System Admin',
+    email: adminUser.toLowerCase(),
+    phone: null,
+    role: 'admin',
+    is_verified: 1,
+    verification_code: null,
+    verification_expires_at: null,
+    created_at: new Date().toISOString(),
+  });
+}
+
+/**
+ * Auto-create tables for users, devices, location history, and command logs.
+ */
+async function ensureTablesExist() {
+  if (!pool) return;
+
+  try {
+    // 1. Users Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        email VARCHAR(128) UNIQUE NOT NULL,
+        username VARCHAR(128) NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        name VARCHAR(128) NULL,
+        phone VARCHAR(32) NULL,
+        role ENUM('admin', 'user') DEFAULT 'user',
+        is_verified TINYINT(1) DEFAULT 0,
+        verification_code VARCHAR(16) NULL,
+        verification_expires_at DATETIME NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_email (email),
+        INDEX idx_username (username)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    // Gracefully add verification columns if users table was created previously without them
+    try { await pool.query('ALTER TABLE users ADD COLUMN is_verified TINYINT(1) DEFAULT 0'); } catch {}
+    try { await pool.query('ALTER TABLE users ADD COLUMN verification_code VARCHAR(16) NULL'); } catch {}
+    try { await pool.query('ALTER TABLE users ADD COLUMN verification_expires_at DATETIME NULL'); } catch {}
+
+    // 2. Devices Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS devices (
+        imei VARCHAR(32) PRIMARY KEY,
+        name VARCHAR(128) NULL,
+        plate_number VARCHAR(32) NULL,
+        sim_number VARCHAR(32) NULL,
+        model VARCHAR(64) DEFAULT 'Cantrack G02',
+        user_id BIGINT NULL,
+        protocol VARCHAR(32) DEFAULT 'HQ',
+        icon TEXT NULL,
+        connected TINYINT(1) DEFAULT 0,
+        last_latitude DECIMAL(10, 7) NULL,
+        last_longitude DECIMAL(10, 7) NULL,
+        speed_kmh FLOAT DEFAULT 0,
+        direction FLOAT DEFAULT 0,
+        acc_on TINYINT(1) DEFAULT 0,
+        is_oil_cut TINYINT(1) DEFAULT 0,
+        is_backup_battery TINYINT(1) DEFAULT 0,
+        gps_status VARCHAR(8) DEFAULT 'V',
+        battery_level INT NULL,
+        last_seen_at DATETIME NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_user_id (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    // Gracefully add any missing columns in devices table if created in earlier schema version
+    const deviceColumns = [
+      'name VARCHAR(128) NULL',
+      'plate_number VARCHAR(32) NULL',
+      'sim_number VARCHAR(32) NULL',
+      'model VARCHAR(64) DEFAULT "Cantrack G02"',
+      'user_id BIGINT NULL',
+      'protocol VARCHAR(32) DEFAULT "HQ"',
+      'icon TEXT NULL',
+      'connected TINYINT(1) DEFAULT 0',
+      'last_latitude DECIMAL(10, 7) NULL',
+      'last_longitude DECIMAL(10, 7) NULL',
+      'speed_kmh FLOAT DEFAULT 0',
+      'direction FLOAT DEFAULT 0',
+      'acc_on TINYINT(1) DEFAULT 0',
+      'is_oil_cut TINYINT(1) DEFAULT 0',
+      'is_backup_battery TINYINT(1) DEFAULT 0',
+      'gps_status VARCHAR(8) DEFAULT "V"',
+      'battery_level INT NULL',
+      'last_seen_at DATETIME NULL',
+    ];
+
+    for (const colDef of deviceColumns) {
+      try {
+        await pool.query(`ALTER TABLE devices ADD COLUMN ${colDef}`);
+      } catch (_) {}
+    }
+
+    // 3. Location History Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS location_history (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        imei VARCHAR(32) NOT NULL,
+        latitude DECIMAL(10, 7) NOT NULL,
+        longitude DECIMAL(10, 7) NOT NULL,
+        speed_kmh FLOAT DEFAULT 0,
+        direction FLOAT DEFAULT 0,
+        acc_on TINYINT(1) DEFAULT 0,
+        gps_status VARCHAR(8) DEFAULT 'A',
+        raw_data TEXT NULL,
+        recorded_at DATETIME NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_imei_recorded (imei, recorded_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    // 4. Command Logs / Queue Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS command_logs (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        command_id VARCHAR(64) UNIQUE NOT NULL,
+        imei VARCHAR(32) NOT NULL,
+        cmd_code VARCHAR(32) NOT NULL,
+        command_string TEXT NOT NULL,
+        status ENUM('QUEUED', 'SENT', 'ACKED', 'FAILED', 'CANCELLED') DEFAULT 'QUEUED',
+        params_json TEXT NULL,
+        error_message TEXT NULL,
+        queued_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        dispatched_at DATETIME NULL,
+        acked_at DATETIME NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_imei_status (imei, status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    logger.info('MYSQL_TABLES_INITIALIZED', {
+      tables: ['users', 'devices', 'location_history', 'command_logs'],
+      message: 'Database schema verified and ready.',
+    });
+  } catch (err) {
+    logger.error('MYSQL_SCHEMA_ERROR', {
+      error: err.message,
+      message: 'Failed to create required MySQL tables.',
+    });
+  }
+}
+
+/**
+ * Seed default admin account into MySQL from GATEWAY_USERNAME and GATEWAY_PASSWORD.
+ */
+async function seedDefaultAdmin() {
+  if (!pool || !isConnected) return;
+
+  const adminUser = (process.env.ADMIN_USER || process.env.GATEWAY_USERNAME || 'momohofficial@gmail.com').toLowerCase();
+  const adminPwd  = process.env.ADMIN_PWD  || process.env.GATEWAY_PASSWORD || '@Samuel196';
+
+  try {
+    const [rows] = await pool.query('SELECT * FROM users WHERE email = ? OR username = ? LIMIT 1', [adminUser, adminUser]);
+    if (rows.length === 0) {
+      const hashed = hashPassword(adminPwd);
+      await pool.query(
+        'INSERT INTO users (email, username, password_hash, name, role, is_verified) VALUES (?, ?, ?, ?, ?, ?)',
+        [adminUser, adminUser, hashed, 'System Admin', 'admin', 1]
+      );
+      logger.info('ADMIN_SEEDED_SUCCESS', {
+        email: adminUser,
+        role: 'admin',
+        message: 'Default admin account seeded successfully into MySQL users table.',
+      });
+    } else if (!rows[0].is_verified) {
+      await pool.query('UPDATE users SET is_verified = 1 WHERE id = ?', [rows[0].id]);
+    }
+  } catch (err) {
+    logger.warn('ADMIN_SEED_ERROR', { error: err.message });
+  }
+}
+
+// ── User Management Methods ───────────────────────────────────────────────────
+
+/**
+ * Create a new user with email & password (immediately active).
+ */
+async function createUser({ email, password, name = '', phone = '', username = '', role = 'user' }) {
+  if (!email || !password) {
+    throw new Error('Email and password are required.');
+  }
+
+  const cleanEmail = email.trim().toLowerCase();
+  const cleanUsername = (username || cleanEmail).trim().toLowerCase();
+  const passwordHash = hashPassword(password);
+  const userRole = role === 'admin' ? 'admin' : 'user';
+
+  if (pool && isConnected) {
+    try {
+      const [res] = await pool.query(
+        'INSERT INTO users (email, username, password_hash, name, phone, role, is_verified) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [cleanEmail, cleanUsername, passwordHash, name || null, phone || null, userRole, 1]
+      );
+
+      logger.info('USER_REGISTERED_SUCCESS', {
+        userId: res.insertId,
+        email: cleanEmail,
+        role: userRole,
+      });
+
+      return {
+        id: res.insertId,
+        email: cleanEmail,
+        username: cleanUsername,
+        name,
+        phone,
+        role: userRole,
+      };
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY') {
+        throw new Error(`Email or username '${cleanEmail}' is already registered.`);
+      }
+      throw err;
+    }
+  }
+
+  // Memory fallback
+  if (memoryUsers.has(cleanEmail) || memoryUsers.has(cleanUsername)) {
+    throw new Error(`Email '${cleanEmail}' is already registered.`);
+  }
+  const id = memoryUsers.size + 1;
+  const userObj = {
+    id,
+    email: cleanEmail,
+    username: cleanUsername,
+    password_hash: passwordHash,
+    name,
+    phone,
+    role: userRole,
+    is_verified: 1,
+    created_at: new Date().toISOString(),
+  };
+
+  memoryUsers.set(cleanEmail, userObj);
+  memoryUsers.set(cleanUsername, userObj);
+
+  logger.info('USER_REGISTERED_SUCCESS', {
+    userId: id,
+    email: cleanEmail,
+    role: userRole,
+  });
+
+  return {
+    id,
+    email: cleanEmail,
+    username: cleanUsername,
+    name,
+    phone,
+    role: userRole,
+  };
+}
+
+/**
+ * Find user by email or username.
+ */
+async function findUserByEmailOrUsername(identifier) {
+  if (!identifier) return null;
+  const clean = identifier.trim().toLowerCase();
+
+  if (pool && isConnected) {
+    try {
+      const [rows] = await pool.query(
+        'SELECT * FROM users WHERE email = ? OR username = ? LIMIT 1',
+        [clean, clean]
+      );
+      return rows[0] || null;
+    } catch (err) {
+      logger.error('MYSQL_FIND_USER_ERROR', { identifier: clean, error: err.message });
+    }
+  }
+
+  return memoryUsers.get(clean) || null;
+}
+
+/**
+ * Find user by username.
+ */
+async function findUserByUsername(username) {
+  return findUserByEmailOrUsername(username);
+}
+
+/**
+ * Find user by ID.
+ */
+async function findUserById(id) {
+  if (!id) return null;
+
+  if (pool && isConnected) {
+    try {
+      const [rows] = await pool.query(
+        'SELECT id, email, username, name, phone, role, is_verified, created_at FROM users WHERE id = ? LIMIT 1',
+        [id]
+      );
+      return rows[0] || null;
+    } catch (err) {
+      logger.error('MYSQL_FIND_USER_ID_ERROR', { id, error: err.message });
+    }
+  }
+
+  for (const user of memoryUsers.values()) {
+    if (user.id === parseInt(id, 10)) {
+      const { password_hash, ...safe } = user;
+      return safe;
+    }
+  }
+  return null;
+}
+
+// ── Device Management Methods ─────────────────────────────────────────────────
+
+async function ensureDeviceColumns() {
+  if (!pool) return;
+  const deviceColumns = [
+    'name VARCHAR(128) NULL',
+    'plate_number VARCHAR(32) NULL',
+    'sim_number VARCHAR(32) NULL',
+    'model VARCHAR(64) DEFAULT "Cantrack G02"',
+    'user_id BIGINT NULL',
+    'protocol VARCHAR(32) DEFAULT "HQ"',
+    'icon TEXT NULL',
+    'connected TINYINT(1) DEFAULT 0',
+    'last_latitude DECIMAL(10, 7) NULL',
+    'last_longitude DECIMAL(10, 7) NULL',
+    'speed_kmh FLOAT DEFAULT 0',
+    'direction FLOAT DEFAULT 0',
+    'acc_on TINYINT(1) DEFAULT 0',
+    'is_oil_cut TINYINT(1) DEFAULT 0',
+    'is_backup_battery TINYINT(1) DEFAULT 0',
+    'gps_status VARCHAR(8) DEFAULT "V"',
+    'battery_level INT NULL',
+    'last_seen_at DATETIME NULL',
+  ];
+
+  for (const colDef of deviceColumns) {
+    try {
+      await pool.query(`ALTER TABLE devices ADD COLUMN ${colDef}`);
+    } catch (_) {}
+  }
+}
+
+/**
+ * Register a new GPS tracker device in the system.
+ */
+async function registerNewDevice({ imei, name = '', plateNumber = '', simNumber = '', model = 'Cantrack G02', userId = null, protocol = 'HQ', icon = null }) {
+  if (!imei) throw new Error('IMEI is required');
+
+  if (pool && isConnected) {
+    const sql = `
+      INSERT INTO devices (
+        imei, name, plate_number, sim_number, model, user_id, protocol, icon
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        name = COALESCE(VALUES(name), name),
+        plate_number = COALESCE(VALUES(plate_number), plate_number),
+        sim_number = COALESCE(VALUES(sim_number), sim_number),
+        model = COALESCE(VALUES(model), model),
+        user_id = COALESCE(VALUES(user_id), user_id),
+        protocol = VALUES(protocol),
+        icon = COALESCE(VALUES(icon), icon);
+    `;
+    const params = [
+      imei,
+      name || `Tracker ${imei}`,
+      plateNumber || null,
+      simNumber || null,
+      model || 'Cantrack G02',
+      userId || null,
+      protocol || 'HQ',
+      icon || null,
+    ];
+
+    try {
+      await pool.query(sql, params);
+      return {
+        imei,
+        name: name || `Tracker ${imei}`,
+        plateNumber,
+        simNumber,
+        model,
+        userId,
+        protocol,
+        icon,
+      };
+    } catch (err) {
+      if (err.code === 'ER_BAD_FIELD_ERROR' || err.message?.includes('Unknown column')) {
+        await ensureDeviceColumns();
+        await pool.query(sql, params);
+        return {
+          imei,
+          name: name || `Tracker ${imei}`,
+          plateNumber,
+          simNumber,
+          model,
+          userId,
+          protocol,
+          icon,
+        };
+      }
+      logger.error('MYSQL_REGISTER_DEVICE_ERROR', { imei, error: err.message });
+      throw err;
+    }
+  }
+
+  const devObj = {
+    imei,
+    name: name || `Tracker ${imei}`,
+    plate_number: plateNumber || null,
+    sim_number: simNumber || null,
+    model: model || 'Cantrack G02',
+    user_id: userId || null,
+    protocol: protocol || 'HQ',
+    icon: icon || null,
+  };
+  memoryDevices.set(imei, devObj);
+
+  return {
+    imei,
+    name: devObj.name,
+    plateNumber,
+    simNumber,
+    model: devObj.model,
+    userId,
+    protocol: devObj.protocol,
+    icon: devObj.icon,
+  };
+}
+
+/**
+ * Update device metadata.
+ */
+async function updateDeviceInfo(imei, { name, plateNumber, simNumber, model, userId, icon }) {
+  if (memoryDevices.has(imei)) {
+    const d = memoryDevices.get(imei);
+    if (name !== undefined) d.name = name;
+    if (plateNumber !== undefined) d.plate_number = plateNumber;
+    if (simNumber !== undefined) d.sim_number = simNumber;
+    if (model !== undefined) d.model = model;
+    if (userId !== undefined) d.user_id = userId;
+    if (icon !== undefined) d.icon = icon;
+  }
+
+  if (!pool || !isConnected || !imei) return true;
+
+  const updates = [];
+  const values = [];
+
+  if (name !== undefined) { updates.push('name = ?'); values.push(name); }
+  if (plateNumber !== undefined) { updates.push('plate_number = ?'); values.push(plateNumber); }
+  if (simNumber !== undefined) { updates.push('sim_number = ?'); values.push(simNumber); }
+  if (model !== undefined) { updates.push('model = ?'); values.push(model); }
+  if (userId !== undefined) { updates.push('user_id = ?'); values.push(userId); }
+  if (icon !== undefined) { updates.push('icon = ?'); values.push(icon); }
+
+  if (updates.length === 0) return true;
+  values.push(imei);
+
+  const sql = `UPDATE devices SET ${updates.join(', ')} WHERE imei = ?`;
+
+  try {
+    const [res] = await pool.query(sql, values);
+    return res.affectedRows > 0;
+  } catch (err) {
+    if (err.code === 'ER_BAD_FIELD_ERROR' || err.message?.includes('Unknown column')) {
+      await ensureDeviceColumns();
+      const [res] = await pool.query(sql, values);
+      return res.affectedRows > 0;
+    }
+    logger.error('MYSQL_UPDATE_DEVICE_ERROR', { imei, error: err.message });
+    return false;
+  }
+}
+
+/**
+ * Find device by IMEI.
+ */
+async function getDeviceByImei(imei) {
+  if (!imei) return null;
+
+  if (pool && isConnected) {
+    try {
+      const [rows] = await pool.query('SELECT * FROM devices WHERE imei = ? LIMIT 1', [imei]);
+      if (rows[0]) return rows[0];
+    } catch (err) {
+      logger.error('MYSQL_GET_DEVICE_ERROR', { imei, error: err.message });
+    }
+  }
+  return memoryDevices.get(imei) || null;
+}
+
+/**
+ * Get all devices registered to a specific user.
+ */
+async function getDevicesByUser(userId) {
+  if (!userId) return [];
+
+  if (pool && isConnected) {
+    try {
+      const [rows] = await pool.query('SELECT * FROM devices WHERE user_id = ? ORDER BY created_at DESC', [userId]);
+      if (rows && rows.length > 0) return rows;
+    } catch (err) {
+      logger.error('MYSQL_GET_USER_DEVICES_ERROR', { userId, error: err.message });
+    }
+  }
+
+  const userDevs = [];
+  for (const d of memoryDevices.values()) {
+    if (d.user_id && String(d.user_id) === String(userId)) {
+      userDevs.push(d);
+    }
+  }
+  return userDevs;
+}
+
+/**
+ * Permanently delete a device and purge all associated records (location history, command logs, metadata).
+ */
+async function deleteDevice(imei) {
+  if (!imei) return false;
+  const targetImei = String(imei).trim();
+  memoryDevices.delete(targetImei);
+
+  if (!pool || !isConnected) return true;
+
+  try {
+    // 1. Purge all location history for this device
+    await pool.query('DELETE FROM location_history WHERE imei = ?', [targetImei]);
+
+    // 2. Purge all command logs for this device
+    await pool.query('DELETE FROM command_logs WHERE imei = ?', [targetImei]);
+
+    // 3. Purge device registration record
+    const [res] = await pool.query('DELETE FROM devices WHERE imei = ?', [targetImei]);
+
+    logger.info('DEVICE_AND_RECORDS_PURGED', {
+      imei: targetImei,
+      tablesPurged: ['location_history', 'command_logs', 'devices'],
+    });
+
+    return res.affectedRows > 0;
+  } catch (err) {
+    logger.error('MYSQL_DELETE_DEVICE_ERROR', { imei: targetImei, error: err.message });
+    throw err;
+  }
+}
+
+/**
+ * Upsert latest device telemetry state.
+ */
+async function upsertDevice(dev) {
+  if (!pool || !isConnected || !dev?.imei) return;
+
+  try {
+    const lastSeen = dev.lastSeen || dev.timestamp || new Date();
+    const recordedAt = new Date(lastSeen);
+    const validDate = isNaN(recordedAt.getTime()) ? new Date() : recordedAt;
+
+    const sql = `
+      INSERT INTO devices (
+        imei, protocol, connected, last_latitude, last_longitude,
+        speed_kmh, direction, acc_on, is_oil_cut, is_backup_battery,
+        gps_status, battery_level, last_seen_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        protocol = VALUES(protocol),
+        connected = VALUES(connected),
+        last_latitude = COALESCE(VALUES(last_latitude), last_latitude),
+        last_longitude = COALESCE(VALUES(last_longitude), last_longitude),
+        speed_kmh = VALUES(speed_kmh),
+        direction = VALUES(direction),
+        acc_on = VALUES(acc_on),
+        is_oil_cut = VALUES(is_oil_cut),
+        is_backup_battery = VALUES(is_backup_battery),
+        gps_status = VALUES(gps_status),
+        battery_level = COALESCE(VALUES(battery_level), battery_level),
+        last_seen_at = VALUES(last_seen_at);
+    `;
+
+    await pool.query(sql, [
+      dev.imei,
+      dev.protocol || 'HQ',
+      dev.connected ? 1 : 0,
+      dev.latitude !== undefined && !isNaN(dev.latitude) ? dev.latitude : null,
+      dev.longitude !== undefined && !isNaN(dev.longitude) ? dev.longitude : null,
+      dev.speed_kmh || 0,
+      dev.direction || 0,
+      dev.accOn ? 1 : 0,
+      dev.isOilCut ? 1 : 0,
+      dev.isBackupBattery ? 1 : 0,
+      dev.gpsStatus || 'V',
+      dev.batteryLevel !== undefined ? dev.batteryLevel : null,
+      validDate,
+    ]);
+  } catch (err) {
+    logger.error('MYSQL_UPSERT_DEVICE_ERROR', { imei: dev.imei, error: err.message });
+  }
+}
+
+/**
+ * Save a trajectory waypoint to location_history.
+ */
+async function saveLocationHistory(loc) {
+  if (!pool || !isConnected || !loc?.imei || isNaN(loc.latitude) || isNaN(loc.longitude)) return;
+
+  try {
+    const rawDate = loc.timestamp || loc.ts || new Date();
+    const recordedAt = new Date(rawDate);
+    const validDate = isNaN(recordedAt.getTime()) ? new Date() : recordedAt;
+
+    const sql = `
+      INSERT INTO location_history (
+        imei, latitude, longitude, speed_kmh, direction, acc_on, gps_status, raw_data, recorded_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+    `;
+
+    await pool.query(sql, [
+      loc.imei,
+      loc.latitude,
+      loc.longitude,
+      loc.speed_kmh || 0,
+      loc.direction || 0,
+      loc.accOn ? 1 : 0,
+      loc.gpsStatus || 'A',
+      loc.raw_hex || loc.ascii || null,
+      validDate,
+    ]);
+  } catch (err) {
+    logger.error('MYSQL_SAVE_LOCATION_ERROR', { imei: loc.imei, error: err.message });
+  }
+}
+
+/**
+ * Log an enqueued or executed command.
+ */
+async function logCommand({ commandId, imei, cmdCode, commandString, status = 'QUEUED', params = null }) {
+  if (!pool || !isConnected) return;
+
+  try {
+    const sql = `
+      INSERT INTO command_logs (
+        command_id, imei, cmd_code, command_string, status, params_json
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        status = VALUES(status),
+        params_json = VALUES(params_json);
+    `;
+
+    await pool.query(sql, [
+      commandId,
+      imei,
+      cmdCode,
+      commandString,
+      status,
+      params ? JSON.stringify(params) : null,
+    ]);
+  } catch (err) {
+    logger.error('MYSQL_LOG_COMMAND_ERROR', { commandId, imei, error: err.message });
+  }
+}
+
+/**
+ * Update the status of a logged command.
+ */
+async function updateCommandStatus(commandId, status, extra = {}) {
+  if (!pool || !isConnected || !commandId) return;
+
+  try {
+    const updates = ['status = ?'];
+    const values = [status];
+
+    if (status === 'SENT') {
+      updates.push('dispatched_at = CURRENT_TIMESTAMP');
+    } else if (status === 'ACKED') {
+      updates.push('acked_at = CURRENT_TIMESTAMP');
+    }
+
+    if (extra.error) {
+      updates.push('error_message = ?');
+      values.push(extra.error);
+    }
+
+    values.push(commandId);
+
+    const sql = `UPDATE command_logs SET ${updates.join(', ')} WHERE command_id = ?`;
+    await pool.query(sql, values);
+  } catch (err) {
+    logger.error('MYSQL_UPDATE_COMMAND_STATUS_ERROR', { commandId, status, error: err.message });
+  }
+}
+
+/**
+ * Retrieve trajectory history for an IMEI.
+ */
+async function getLocationHistory(imei, limit = 100, since = null) {
+  if (!pool || !isConnected || !imei) return [];
+
+  try {
+    let sql = 'SELECT * FROM location_history WHERE imei = ?';
+    const params = [imei];
+
+    if (since) {
+      sql += ' AND recorded_at >= ?';
+      params.push(new Date(since));
+    }
+
+    sql += ' ORDER BY recorded_at DESC LIMIT ?';
+    params.push(Math.min(parseInt(limit, 10) || 100, 1000));
+
+    const [rows] = await pool.query(sql, params);
+    return rows;
+  } catch (err) {
+    logger.error('MYSQL_GET_HISTORY_ERROR', { imei, error: err.message });
+    return [];
+  }
+}
+
+/**
+ * Retrieve recent command logs for an IMEI.
+ */
+async function getCommandLogs(imei, limit = 50) {
+  if (!pool || !isConnected || !imei) return [];
+
+  try {
+    const sql = 'SELECT * FROM command_logs WHERE imei = ? ORDER BY created_at DESC LIMIT ?';
+    const [rows] = await pool.query(sql, [imei, Math.min(parseInt(limit, 10) || 50, 200)]);
+    return rows;
+  } catch (err) {
+    logger.error('MYSQL_GET_COMMAND_LOGS_ERROR', { imei, error: err.message });
+    return [];
+  }
+}
+
+module.exports = {
+  initMysql,
+  createUser,
+  findUserByEmailOrUsername,
+  findUserByUsername,
+  findUserById,
+  registerNewDevice,
+  getDeviceByImei,
+  getDevicesByUser,
+  updateDeviceInfo,
+  deleteDevice,
+  upsertDevice,
+  saveLocationHistory,
+  logCommand,
+  updateCommandStatus,
+  getLocationHistory,
+  getCommandLogs,
+  isMysqlConnected: () => isConnected,
+  getPool: () => pool,
+};

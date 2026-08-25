@@ -21,6 +21,8 @@
 const net                   = require('net');
 const { logger }            = require('./logger');
 const { gpsEventEmitter }   = require('./gpsEvents');
+const { upsertDevice, saveLocationHistory } = require('./db/mysql');
+const { flushQueuedCommands } = require('./services/commandQueue');
 
 // Dynamic flag checker for raw debugging
 const isRawDebug = () => process.env.GPS_RAW_DEBUG === 'true';
@@ -425,6 +427,17 @@ function registerDevice(imei, socket, protocol, state) {
     connectedAt: trackerState.connectedAt || new Date().toISOString(),
     lastActivityAt: trackerState.lastActivityAt,
   });
+
+  // Persist device state to MySQL
+  upsertDevice({
+    imei,
+    protocol: protocol || trackerState.protocol || 'HQ',
+    connected: true,
+    lastSeen: trackerState.lastActivityAt || new Date().toISOString(),
+  });
+
+  // Auto-flush pending queued commands when device connects/wakes up
+  flushQueuedCommands(imei, sendDeviceCommand);
 
   gpsEventEmitter.emit('gps:connected', {
     imei,
@@ -870,6 +883,34 @@ function handleHqGps(socket, imei, fields, state, cmd = 'V1') {
 
   gpsEventEmitter.emit('gps:update', payload);
 
+  // Persist trajectory and device status to MySQL
+  saveLocationHistory({
+    imei,
+    latitude,
+    longitude,
+    speed_kmh: speedKmh,
+    direction,
+    accOn: vehicleStatus.accOn,
+    gpsStatus,
+    timestamp,
+    raw_hex: fields.join(','),
+  });
+
+  upsertDevice({
+    imei,
+    protocol: 'HQ',
+    connected: true,
+    latitude,
+    longitude,
+    speed_kmh: speedKmh,
+    direction,
+    accOn: vehicleStatus.accOn,
+    isOilCut: vehicleStatus.isOilCut,
+    isBackupBattery: vehicleStatus.isBackupBattery,
+    gpsStatus,
+    lastSeen: timestamp,
+  });
+
   // Respond immediately with H02/A3 V4 confirmation response: *HQ,<IMEI>,V4,V1,<YYYYMMDDHHMMSS>#\r\n
   const v4Timestamp = formatV1Timestamp(timeRaw, dateRaw);
   const ack = buildHqAck(imei, cmd, v4Timestamp);
@@ -1273,11 +1314,21 @@ function createGt06Server(port) {
           connected: false,
           lastActivityAt: new Date().toISOString(),
         });
+        upsertDevice({
+          imei: state.imei,
+          connected: false,
+          lastSeen: new Date().toISOString(),
+        });
       } else {
         for (const [imei, sock] of deviceRegistry.entries()) {
           if (sock === socket) {
             deviceRegistry.delete(imei);
             updateDeviceState(imei, { connected: false });
+            upsertDevice({
+              imei,
+              connected: false,
+              lastSeen: new Date().toISOString(),
+            });
           }
         }
       }
@@ -1385,6 +1436,8 @@ module.exports = {
   enforceContinuousTracking,
   getConnectedDevices,
   getDeviceState,
+  updateDeviceState,
+  isDeviceConnected: (imei) => deviceRegistry.has(imei),
   _processBuffer:     processBuffer,
   _processHqBuffer:   processHqBuffer,
   _processGt06Buffer: processGt06Buffer,

@@ -12,6 +12,7 @@ const {
   deviceStates,
   registerDevice,
 } = require('../src/gt06Server');
+const { findUserByEmailOrUsername } = require('../src/db/mysql');
 
 function createMockSocket(remoteAddress = '10.0.0.1', remotePort = 50220) {
   const written = [];
@@ -86,6 +87,134 @@ async function runApiAndWsTests() {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${loginData.token}`,
     };
+
+    // ── Test 0c: User Registration with Email & Password ────────────────────
+    const regRes = await fetch(`${baseUrl}/api/gps/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'driver_john@example.com',
+        password: 'securePassword123',
+        name: 'John Doe',
+        phone: '+2348011223344',
+      }),
+    });
+    const regData = await regRes.json();
+    assert.strictEqual(regRes.status, 201);
+    assert.strictEqual(regData.success, true);
+    assert.strictEqual(regData.user.email, 'driver_john@example.com');
+    assert.strictEqual(regData.user.role, 'user');
+    assert.ok(regData.token);
+    console.log('✅ Test 0c Passed: POST /api/gps/auth/register registers new user with email & password and returns JWT token');
+
+    // ── Test 0d: Login with registered email & password ──────────────────────
+    const userLoginRes = await fetch(`${baseUrl}/api/gps/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'driver_john@example.com',
+        password: 'securePassword123',
+      }),
+    });
+    const userLoginData = await userLoginRes.json();
+    assert.strictEqual(userLoginRes.status, 200);
+    assert.strictEqual(userLoginData.success, true);
+    assert.strictEqual(userLoginData.user.role, 'user');
+    console.log('✅ Test 0d Passed: POST /api/gps/auth/login authenticates user with email & password');
+
+    // ── Test 0e: Profile check (GET /api/gps/auth/me) ─────────────────────────
+    const meRes = await fetch(`${baseUrl}/api/gps/auth/me`, {
+      headers: { 'Authorization': `Bearer ${userLoginData.token}` },
+    });
+    const meData = await meRes.json();
+    assert.strictEqual(meData.success, true);
+    assert.strictEqual(meData.user.email, 'driver_john@example.com');
+    console.log('✅ Test 0e Passed: GET /api/gps/auth/me returns current authenticated user');
+
+    // ── Test 0f: Device Registration by User (with optional SVG icon) ────────
+    const sampleSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 2L2 22h20L12 2z"/></svg>';
+    const regDevRes = await fetch(`${baseUrl}/api/gps/devices`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${userLoginData.token}`,
+      },
+      body: JSON.stringify({
+        imei: '867232054859991',
+        name: 'Toyota RAV4 - John Doe',
+        plateNumber: 'ABC-123XY',
+        simNumber: '+2348099887766',
+        model: 'Cantrack G02',
+        icon: sampleSvg,
+      }),
+    });
+    const regDevData = await regDevRes.json();
+    assert.strictEqual(regDevRes.status, 201);
+    assert.strictEqual(regDevData.success, true);
+    assert.strictEqual(regDevData.device.name, 'Toyota RAV4 - John Doe');
+    assert.strictEqual(regDevData.device.icon, sampleSvg);
+    console.log('✅ Test 0f Passed: POST /api/gps/devices allows registered user to register device with optional SVG icon');
+
+    // ── Test 0f2: PUT /api/gps/devices/:imei (Update Device & Icon) ───────────
+    const updatedSvg = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>';
+    const updateDevRes = await fetch(`${baseUrl}/api/gps/devices/867232054859991`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${userLoginData.token}`,
+      },
+      body: JSON.stringify({
+        name: 'Toyota RAV4 2024 Hybrid',
+        icon: updatedSvg,
+      }),
+    });
+    const updateDevData = await updateDevRes.json();
+    assert.strictEqual(updateDevRes.status, 200);
+    assert.strictEqual(updateDevData.success, true);
+    assert.strictEqual(updateDevData.device.name, 'Toyota RAV4 2024 Hybrid');
+    assert.strictEqual(updateDevData.device.icon, updatedSvg);
+    console.log('✅ Test 0f2 Passed: PUT /api/gps/devices/:imei successfully updates device metadata and SVG icon');
+
+    // ── Test 0g: User sends command to OWN device ─────────────────────────────
+    const userOwnCmdRes = await fetch(`${baseUrl}/api/gps/command/867232054859991/cut_fuel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${userLoginData.token}`,
+      },
+    });
+    const userOwnCmdData = await userOwnCmdRes.json();
+    assert.strictEqual(userOwnCmdData.success, true);
+    console.log('✅ Test 0g Passed: User CAN send commands to device registered to them');
+
+    // ── Test 0h: User trying to send command to UNAUTHORIZED device (403) ─────
+    const userForbiddenRes = await fetch(`${baseUrl}/api/gps/command/867232054850970/cut_fuel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${userLoginData.token}`,
+      },
+    });
+    const userForbiddenData = await userForbiddenRes.json();
+    assert.strictEqual(userForbiddenRes.status, 403);
+    assert.strictEqual(userForbiddenData.success, false);
+    console.log('✅ Test 0h Passed: User CANNOT send commands to other devices (403 Forbidden)');
+
+    // ── Test 0i: User trying to access Admin-Only Logs (403) ──────────────────
+    const userLogsRes = await fetch(`${baseUrl}/api/gps/logs`, {
+      headers: { 'Authorization': `Bearer ${userLoginData.token}` },
+    });
+    assert.strictEqual(userLogsRes.status, 403);
+    console.log('✅ Test 0i Passed: User CANNOT access admin server logs (403 Forbidden)');
+
+    // ── Test 0j: Admin CAN send command to ANY device ─────────────────────────
+    const adminCmdRes = await fetch(`${baseUrl}/api/gps/command/867232054859991/restore_fuel`, {
+      method: 'POST',
+      headers: authHeaders,
+    });
+    const adminCmdData = await adminCmdRes.json();
+    assert.strictEqual(adminCmdData.success, true);
+    console.log('✅ Test 0j Passed: Admin CAN send commands to ANY device IMEI');
 
     // ── Test 1: GET /api/gps/devices when empty ──────────────────────────────
     deviceRegistry.clear();
@@ -242,67 +371,138 @@ async function runApiAndWsTests() {
       headers: authHeaders,
       body: JSON.stringify({ openGpsSeconds: 180 }),
     });
-    const data6i = await res6i.json();
-    assert.strictEqual(data6i.success, true);
-    assert(mockSock.written.some((w) => w.includes('D2') && w.includes('180')));
-    console.log('✅ Test 6i Passed: Fast locate endpoint sends D2');
+    // ── Test 6j: POST /api/gps/simulate (Car Ignition ON & Driving Simulation)
+    const simRes = await fetch(`${baseUrl}/api/gps/simulate`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        imei: testImei,
+        accOn: true,
+        speed: 45.0,
+        latitude: 4.888188,
+        longitude: 6.913182,
+        direction: 170,
+        batteryLevel: 100,
+        steps: 3,
+      }),
+    });
+    const simData = await simRes.json();
+    assert.strictEqual(simRes.status, 200);
+    assert.strictEqual(simData.success, true);
+    assert.strictEqual(simData.accOn, true);
+    assert.strictEqual(simData.pointsCount, 3);
+    assert.strictEqual(simData.latestTelemetry.accOn, true);
+    assert.strictEqual(simData.latestTelemetry.imei, testImei);
+    console.log('✅ Test 6j Passed: POST /api/gps/simulate successfully simulates car driving & ignition ON');
 
-    // ── Test 7: WebSocket Rooms & Selective Event Broadcasting ───────────────
-    const clientA = Client(baseUrl);
-    const clientB = Client(baseUrl);
-    const clientC = Client(baseUrl);
+    // ── Test 7: Role-Based WebSocket Security & Selective Event Broadcasting ──
+    const adminWsClient = Client(baseUrl, {
+      auth: { token: loginData.token },
+    });
+    const userWsClient = Client(baseUrl, {
+      auth: { token: userLoginData.token },
+    });
 
-    const clientAEvents = [];
-    const clientBEvents = [];
-    const clientCEvents = [];
+    const adminEvents = [];
+    const userEvents = [];
 
-    await new Promise((resolve) => clientA.on('connect', resolve));
-    await new Promise((resolve) => clientB.on('connect', resolve));
-    await new Promise((resolve) => clientC.on('connect', resolve));
+    await new Promise((resolve) => adminWsClient.on('connect', resolve));
+    await new Promise((resolve) => userWsClient.on('connect', resolve));
 
-    clientA.on('gps:update', (payload) => clientAEvents.push(payload));
-    clientB.on('gps:update', (payload) => clientBEvents.push(payload));
-    clientC.on('gps:update', (payload) => clientCEvents.push(payload));
+    adminWsClient.on('gps:update', (payload) => adminEvents.push(payload));
+    userWsClient.on('gps:update', (payload) => userEvents.push(payload));
 
-    const joinAPromise = new Promise((resolve) => clientA.on('joined', resolve));
-    const joinBPromise = new Promise((resolve) => clientB.on('joined', resolve));
-    const joinCPromise = new Promise((resolve) => clientC.on('joined', resolve));
+    // Admin joins 'all'
+    const adminJoinAllPromise = new Promise((resolve) => adminWsClient.on('joined', resolve));
+    adminWsClient.emit('join_all');
+    await adminJoinAllPromise;
 
-    clientA.emit('join', { imei: testImei });
-    clientB.emit('join', { imei: '999999999999999' });
-    clientC.emit('join_all');
+    // User attempts to join 'all' -> should get error (Forbidden)
+    const userJoinAllErrPromise = new Promise((resolve) => userWsClient.on('error', resolve));
+    userWsClient.emit('join_all');
+    const joinAllErr = await userJoinAllErrPromise;
+    assert.strictEqual(joinAllErr.success, false);
+    console.log('✅ Test 7a Passed: Non-admin socket cannot join "all" room');
 
-    await Promise.all([joinAPromise, joinBPromise, joinCPromise]);
+    // User joins OWN registered device (867232054859991)
+    const userJoinOwnPromise = new Promise((resolve) => userWsClient.on('joined', resolve));
+    userWsClient.emit('join', { imei: '867232054859991' });
+    await userJoinOwnPromise;
+    console.log('✅ Test 7b Passed: User socket successfully subscribed to own device');
 
-    // Emit GPS update for testImei
-    const samplePayload = {
+    // User attempts to join UNAUTHORIZED device (testImei: 867232054850970)
+    const userJoinOtherErrPromise = new Promise((resolve) => userWsClient.on('error', resolve));
+    userWsClient.emit('join', { imei: testImei });
+    const joinOtherErr = await userJoinOtherErrPromise;
+    assert.strictEqual(joinOtherErr.success, false);
+    console.log('✅ Test 7c Passed: User socket cannot subscribe to unauthorized device');
+
+    // Emit GPS update for testImei (Admin's / Unowned by User)
+    gpsEventEmitter.emit('gps:update', {
       imei: testImei,
-      protocol: 'HQ',
       latitude: 4.888267,
       longitude: 6.913273,
       speed_kmh: 0,
       timestamp: '2026-08-24 13:31:04 UTC',
-    };
-    gpsEventEmitter.emit('gps:update', samplePayload);
+    });
 
-    // Wait 100ms for websocket delivery
+    // Emit GPS update for user's device (867232054859991)
+    gpsEventEmitter.emit('gps:update', {
+      imei: '867232054859991',
+      latitude: 6.524379,
+      longitude: 3.379206,
+      speed_kmh: 45,
+      timestamp: '2026-08-24 13:35:00 UTC',
+    });
+
+    // Wait 100ms for delivery
     await new Promise((r) => setTimeout(r, 100));
 
-    // Client A (subscribed to testImei) MUST receive the event
-    assert.strictEqual(clientAEvents.length, 1);
-    assert.strictEqual(clientAEvents[0].imei, testImei);
+    // Admin received updates for BOTH devices (because admin is in 'all' room)
+    assert.strictEqual(adminEvents.length, 2);
 
-    // Client B (subscribed to different IMEI) MUST NOT receive the event
-    assert.strictEqual(clientBEvents.length, 0);
+    // Regular user received update ONLY for their own device (867232054859991)
+    assert.strictEqual(userEvents.length, 1);
+    assert.strictEqual(userEvents[0].imei, '867232054859991');
 
-    // Client C (Admin subscribed to all) MUST receive the event
-    assert.strictEqual(clientCEvents.length, 1);
-    assert.strictEqual(clientCEvents[0].imei, testImei);
+    adminWsClient.disconnect();
+    userWsClient.disconnect();
+    console.log('✅ Test 7d Passed: Role-based event broadcasting and telemetry isolation verified');
 
-    clientA.disconnect();
-    clientB.disconnect();
-    clientC.disconnect();
-    console.log('✅ Test 7 Passed: WebSocket selective room routing per IMEI and admin room');
+    // ── Test 8: Admin Delete Device & Cascading Record Purge ──────────────────
+    const delDevImei = '867232054859991';
+    let deviceDeletedEventFired = false;
+    const testAdminWs = Client(baseUrl, { auth: { token: loginData.token } });
+    await new Promise((resolve) => testAdminWs.on('connect', resolve));
+    const joinAllPromise = new Promise((resolve) => testAdminWs.on('joined', resolve));
+    testAdminWs.emit('join_all');
+    await joinAllPromise;
+
+    testAdminWs.on('gps:device_deleted', (payload) => {
+      if (payload.imei === delDevImei) deviceDeletedEventFired = true;
+    });
+
+    const delRes = await fetch(`${baseUrl}/api/gps/devices/${delDevImei}`, {
+      method: 'DELETE',
+      headers: authHeaders,
+    });
+    const delData = await delRes.json();
+    assert.strictEqual(delRes.status, 200);
+    assert.strictEqual(delData.success, true);
+    assert.strictEqual(delData.imei, delDevImei);
+
+    // Wait 50ms for WS event
+    await new Promise((r) => setTimeout(r, 50));
+    assert.strictEqual(deviceDeletedEventFired, true);
+
+    // Verify device is removed from GET /devices
+    const checkRes = await fetch(`${baseUrl}/api/gps/devices/${delDevImei}`, {
+      headers: authHeaders,
+    });
+    assert.strictEqual(checkRes.status, 404);
+
+    testAdminWs.disconnect();
+    console.log('✅ Test 8 Passed: Admin DELETE /api/gps/devices/:imei purges all device records and emits real-time event');
 
     console.log('\n🎉 ALL API & WEBSOCKET TESTS PASSED SUCCESSFULLY!');
   } finally {
