@@ -734,8 +734,12 @@ const swaggerSpec = {
     '/api/gps/devices/{imei}/raw': {
       post: {
         tags: ['GPS Commands (Cantrack A/3)'],
-        summary: 'Send Raw Cantrack Command',
-        description: 'Send custom raw commands with arguments (e.g. command="WKMD", params=["0"]).',
+        summary: 'Send Raw Tracker Command',
+        description:
+          'Send custom raw commands directly to the tracker over TCP socket.\n\n' +
+          'Supports either:\n' +
+          '1. **Full Raw ASCII String**: `rawCommand: "HQ,867232054850970,S20,195440,1,1#"` or `"*HQ,867232054850970,S20,195440,1,1#"` or `"RELAY,1#"` (automatically formatted and dispatched).\n' +
+          '2. **Structured Command & Params**: `command: "WKMD"`, `params: ["0"]` (automatically wraps in Cantrack frame).',
         parameters: [
           { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970' },
         ],
@@ -745,16 +749,120 @@ const swaggerSpec = {
             'application/json': {
               schema: {
                 type: 'object',
-                required: ['command'],
                 properties: {
-                  command: { type: 'string', example: 'WKMD', description: 'Command code (e.g. WKMD, D1, S20, R1)' },
-                  params:  { type: 'array', items: { type: 'string' }, example: ['0'] },
+                  rawCommand: {
+                    type: 'string',
+                    example: 'HQ,867232054850970,S20,195440,1,1#',
+                    description: 'Full raw command string (with or without leading *).',
+                  },
+                  command: {
+                    type: 'string',
+                    example: 'WKMD',
+                    description: 'Command code (e.g. WKMD, D1, S20, R1) or full raw command string.',
+                  },
+                  params: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    example: ['0'],
+                    description: 'Optional arguments array when using command code.',
+                  },
                 },
               },
             },
           },
         },
-        responses: { 200: { description: 'Raw command sent' } },
+        responses: { 200: { description: 'Raw command sent or queued successfully' } },
+      },
+    },
+
+    '/api/gps/command/{imei}/{cmd}': {
+      post: {
+        tags: ['GPS Commands (Cantrack A/3)'],
+        summary: 'Unified GPS Command Router',
+        description:
+          'Unified router to send or queue any command to the device.\n\n' +
+          'Common command aliases for `{cmd}`:\n' +
+          '- `cut_fuel` / `cut-fuel` (S20: Disable fuel relay)\n' +
+          '- `resume_fuel` / `restore-fuel` (S20: Restore fuel relay)\n' +
+          '- `set_upload_interval` (D1: Interval in seconds)\n' +
+          '- `set_apn` (S24: APN, user, password)\n' +
+          '- `set_ip` (S23: IP and port)\n' +
+          '- `set_speed_alarm` / `clear_speed_alarm` (S33)\n' +
+          '- `set_geofence` / `clear_geofence` (S21)\n' +
+          '- `restart` (R1)\n' +
+          '- `raw` (Send custom `rawCommand` in request body)',
+        parameters: [
+          { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970' },
+          { in: 'path', name: 'cmd', required: true, schema: { type: 'string' }, example: 'cut_fuel' },
+        ],
+        requestBody: {
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  rawCommand: { type: 'string', example: 'HQ,867232054850970,S20,195440,1,1#' },
+                  interval: { type: 'integer', example: 30 },
+                  speed: { type: 'integer', example: 80 },
+                  radius: { type: 'integer', example: 1000 },
+                  params: { type: 'array', items: { type: 'string' } },
+                },
+              },
+            },
+          },
+        },
+        responses: { 200: { description: 'Command dispatched or queued' } },
+      },
+    },
+
+    '/api/gps/devices/{imei}/queue': {
+      get: {
+        tags: ['GPS Commands (Cantrack A/3)'],
+        summary: 'List Queued Offline Commands',
+        description: 'View pending offline commands waiting to execute when the tracker wakes up.',
+        parameters: [
+          { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970' },
+        ],
+        responses: {
+          200: {
+            description: 'List of queued commands',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: true },
+                    imei: { type: 'string', example: '867232054850970' },
+                    count: { type: 'integer', example: 1 },
+                    queued: { type: 'array', items: { type: 'object' } },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      delete: {
+        tags: ['GPS Commands (Cantrack A/3)'],
+        summary: 'Clear All Queued Offline Commands',
+        description: 'Cancels all pending offline commands for this IMEI.',
+        parameters: [
+          { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970' },
+        ],
+        responses: { 200: { description: 'Command queue cleared' } },
+      },
+    },
+
+    '/api/gps/devices/{imei}/queue/{commandId}': {
+      delete: {
+        tags: ['GPS Commands (Cantrack A/3)'],
+        summary: 'Cancel Specific Queued Offline Command',
+        description: 'Cancels an individual queued command by its commandId.',
+        parameters: [
+          { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970' },
+          { in: 'path', name: 'commandId', required: true, schema: { type: 'string' }, example: 'cmd_1787739338577_8wbpw' },
+        ],
+        responses: { 200: { description: 'Command cancelled' } },
       },
     },
 

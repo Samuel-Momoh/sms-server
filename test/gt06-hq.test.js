@@ -16,6 +16,7 @@ const {
   closeGt06Server,
   buildCantrackCommand,
   sendDeviceCommand,
+  sendRawDeviceCommand,
   getConnectedDevices,
   getDeviceState,
   enforceContinuousTracking,
@@ -542,19 +543,36 @@ async function runTests() {
   assert(mockSockP.written[0].startsWith(`*HQ,${imeiO},WKMD,`));
   assert(mockSockP.written[0].endsWith(',0#\r\n'));
 
+  // Test sendRawDeviceCommand: purely trims and writes directly to socket with no builder
+  const rawDirect = `HQ,${imeiO},S20,195440,1,1#`;
+  const resRawDirect = await sendRawDeviceCommand(imeiO, rawDirect);
+  assert.strictEqual(resRawDirect.success, true);
+  assert.strictEqual(resRawDirect.cmd, 'RAW');
+  assert.strictEqual(resRawDirect.command, `HQ,${imeiO},S20,195440,1,1#`);
+  assert.strictEqual(mockSockP.written[1], `HQ,${imeiO},S20,195440,1,1#\r\n`);
+
+  // Test Raw Command starting with '#' (e.g. #supplyoil#123456#)
+  const hashCmd = '#supplyoil#123456#\r\n';
+  const resHash = await sendRawDeviceCommand(imeiO, hashCmd);
+  assert.strictEqual(resHash.success, true);
+  assert.strictEqual(resHash.cmd, 'RAW');
+  assert.strictEqual(resHash.command, '#supplyoil#123456#');
+  assert.strictEqual(mockSockP.written[2], '#supplyoil#123456#\r\n');
+
   // Check device state
   const deviceStateP = getDeviceState(imeiO);
   assert.strictEqual(deviceStateP.connected, true);
-  assert.strictEqual(deviceStateP.lastCommand.cmd, 'WKMD');
+  assert.strictEqual(deviceStateP.lastCommand.cmd, 'RAW');
 
   // Check connected devices list
   const allDevices = getConnectedDevices();
   assert(allDevices.some((d) => d.imei === imeiO && d.connected === true));
 
   // Check event emitter
-  assert(emittedGpsEvents.length > 0);
+  assert(emittedGpsEvents.length >= 3);
   assert.strictEqual(emittedGpsEvents[0].imei, imeiO);
   assert.strictEqual(emittedGpsEvents[0].cmd, 'WKMD');
+  assert.strictEqual(emittedGpsEvents[1].cmd, 'RAW');
 
   gpsEventEmitter.off('gps:command_sent', eventHandlerP);
   console.log('✅ Test P Passed!\n');

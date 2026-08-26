@@ -5,6 +5,7 @@ const {
   getConnectedDevices,
   getDeviceState,
   sendDeviceCommand,
+  sendRawDeviceCommand,
   isDeviceConnected,
   buildCantrackCommand,
   updateDeviceState,
@@ -95,8 +96,8 @@ async function requireDeviceAccess(req, res, next) {
 }
 
 // Helper to send command immediately or queue if device is sleeping/offline
-async function dispatchOrQueue(imei, cmdCode, params = [], req, res) {
-  const result = await enqueueCommand(imei, cmdCode, params, {}, sendDeviceCommand, isDeviceConnected);
+async function dispatchOrQueue(imei, cmdCode, params = [], req, res, sendFn = sendDeviceCommand) {
+  const result = await enqueueCommand(imei, cmdCode, params, {}, sendFn, isDeviceConnected);
   if (!result.success && !result.queued) {
     return res.status(500).json(result);
   }
@@ -630,6 +631,10 @@ router.post('/command/:imei/:cmd', requireDeviceAccess, async (req, res) => {
       cmdCode = 'S25';
       params = [];
       break;
+    case 'raw':
+      cmdCode = body.rawCommand || body.command || body.raw || '';
+      params = Array.isArray(body.params) ? body.params : [];
+      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
     default:
       cmdCode = cmd;
       params = Array.isArray(body.params) ? body.params : (body.param !== undefined ? [body.param] : []);
@@ -777,11 +782,12 @@ router.post('/devices/:imei/working-mode', requireDeviceAccess, async (req, res)
 
 router.post('/devices/:imei/raw', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const { command, params = [] } = req.body || {};
-  if (!command) {
-    return res.status(400).json({ success: false, error: 'command is required (e.g. "WKMD", "D1", "S20")' });
+  const { command, rawCommand, raw, params = [] } = req.body || {};
+  const cmdToSend = rawCommand || command || raw;
+  if (!cmdToSend) {
+    return res.status(400).json({ success: false, error: 'command or rawCommand is required (e.g. "HQ,867232054850970,S20,195440,1,1#", "*HQ,...#", or "WKMD")' });
   }
-  return dispatchOrQueue(imei, command, params, req, res);
+  return dispatchOrQueue(imei, cmdToSend, params, req, res, sendRawDeviceCommand);
 });
 
 // ── Queue Management Endpoints ───────────────────────────────────────────────

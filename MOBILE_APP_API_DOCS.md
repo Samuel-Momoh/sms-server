@@ -441,6 +441,48 @@ Controls how frequently the tracker uploads GPS coordinates.
 
 ---
 
+### 4.9 Send Raw Tracker Command
+Send custom or raw ASCII commands directly to the tracker socket over TCP.
+
+- **Endpoint**: `POST /api/gps/devices/:imei/raw` (or `POST /api/gps/command/:imei/raw`)
+- **Auth Required**: Yes (`Bearer <TOKEN>`)
+
+#### Request Body Options:
+**Option A: Full Raw String (with or without leading `*`)**
+```json
+{
+  "rawCommand": "HQ,867232054850970,S20,195440,1,1#"
+}
+```
+*(Automatically formatted to `*HQ,867232054850970,S20,195440,1,1#\r\n` and sent directly to the device)*
+
+**Option B: Command Code & Parameters**
+```json
+{
+  "command": "WKMD",
+  "params": ["0"]
+}
+```
+
+#### Success Response (`200 OK`):
+```json
+{
+  "success": true,
+  "queued": false,
+  "message": "Command S20 processed successfully for device 867232054850970",
+  "result": {
+    "success": true,
+    "imei": "867232054850970",
+    "cmd": "S20",
+    "command": "*HQ,867232054850970,S20,195440,1,1#",
+    "hex": "2a48512c3836373233323035343835303937302c5332302c3139353434302c312c31230d0a",
+    "sentAt": "2026-08-26T10:19:00.000Z"
+  }
+}
+```
+
+---
+
 ## 5. Offline Command Queue APIs
 
 ### 5.1 View Pending Queued Commands
