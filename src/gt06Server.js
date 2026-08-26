@@ -103,6 +103,103 @@ function getDeviceState(imei) {
 // =============================================================================
 
 /**
+ * Sanitize and clean a command string to avoid double-escaped literal \\r\\n (hex 5c725c6e)
+ * and ensure it is terminated with standard CRLF (\\r\\n / 0x0D 0x0A).
+ *
+ * @param {string} cmd
+ * @returns {string}
+ */
+function sanitizeCommandString(cmd) {
+  if (!cmd) return '';
+  let str = typeof cmd === 'string' ? cmd : String(cmd);
+  str = str.trim();
+  // Strip any literal escaped backslashes \\r, \\n, or actual CRLF from ends
+  str = str.replace(/(\\r|\\n|\r|\n)+$/g, '').replace(/^(\\r|\\n|\r|\n)+/g, '').trim();
+  return `${str}\r\n`;
+}
+
+/**
+ * Build a Secumore hashtag command string
+ *
+ * @param {string} cmd  Command name (e.g. 'stopoil', 'supplyoil', 'at', 'tracker', 'begin', 'speed', 'nospeed', 'ACC', 'admin', 'noadmin', 'password', 'timezone', 'monitor', 'call')
+ * @param {string} [password='123456']
+ * @param {Array<string|number>} [params=[]]
+ * @returns {string}
+ */
+function buildSecumoreCommand(cmd, password = '123456', params = []) {
+  const cleanCmd = String(cmd || '').replace(/^#+|#+$/g, '').toLowerCase();
+  const pwd = password || process.env.TRACKER_DEFAULT_PASSWORD || '123456';
+
+  switch (cleanCmd) {
+    case 'stopoil':
+    case 'cut-fuel':
+    case 'cut_fuel':
+      return sanitizeCommandString(`#stopoil#${pwd}#`);
+    case 'stopelec':
+    case 'cut-elec':
+    case 'cut_elec':
+      return sanitizeCommandString(`#stopelec#${pwd}#`);
+    case 'supplyoil':
+    case 'resume-fuel':
+    case 'resume_fuel':
+    case 'restore-fuel':
+    case 'restore_fuel':
+      return sanitizeCommandString(`#supplyoil#${pwd}#`);
+    case 'supplyelec':
+    case 'resume-elec':
+    case 'restore-elec':
+      return sanitizeCommandString(`#supplyelec#${pwd}#`);
+    case 'at':
+    case 'interval':
+    case 'set-interval':
+      const intervalSecs = params && params[0] !== undefined ? params[0] : 30;
+      return sanitizeCommandString(`#at#${intervalSecs}#sum#0#`);
+    case 'tracker':
+    case 'continuous':
+    case 'realtime':
+      return sanitizeCommandString(`#tracker#${pwd}#`);
+    case 'begin':
+    case 'restart':
+    case 'reset':
+      return sanitizeCommandString(`#begin#${pwd}#`);
+    case 'speed':
+    case 'overspeed':
+      const speedVal = String(params && params[0] !== undefined ? params[0] : 80).padStart(3, '0');
+      return sanitizeCommandString(`#speed#${pwd}#${speedVal}#`);
+    case 'nospeed':
+    case 'clear-speed':
+      return sanitizeCommandString(`#nospeed#${pwd}#`);
+    case 'acc':
+      const state = String((params && params[0]) || 'ON').toUpperCase();
+      return sanitizeCommandString(`#ACC#${state}#`);
+    case 'admin':
+      const adminPhone = (params && params[0]) || '';
+      return sanitizeCommandString(`#admin#${pwd}#${adminPhone}#`);
+    case 'noadmin':
+      const delPhone = (params && params[0]) || '';
+      return sanitizeCommandString(`#noadmin#${pwd}#${delPhone}#`);
+    case 'password':
+      const oldPwd = (params && params[0]) || pwd;
+      const newPwd = (params && params[1]) || '123456';
+      return sanitizeCommandString(`#password#${oldPwd}#${newPwd}#`);
+    case 'timezone':
+      const dir = (params && params[0]) || 'E';
+      const hr = (params && params[1]) || 0;
+      const min = (params && params[2]) || 0;
+      return sanitizeCommandString(`#timezone#${pwd}#${dir}#${hr}#${min}#`);
+    case 'monitor':
+      return sanitizeCommandString(`#monitor#${pwd}#`);
+    case 'call':
+      return sanitizeCommandString(`#call#${pwd}#`);
+    default:
+      if (cmd.startsWith('#') && cmd.endsWith('#')) {
+        return sanitizeCommandString(cmd);
+      }
+      return sanitizeCommandString(`#${cmd}#${pwd}#`);
+  }
+}
+
+/**
  * Build a Cantrack ASCII command string according to Section A.1:
  * Format: *HQ,<IMEI>,<CMD>,<HHMMSS>,<PARAM1>,<PARAM2>,...#\r\n
  *
@@ -117,12 +214,12 @@ function buildCantrackCommand(imei, cmd, params = [], timeStr) {
   const pad = (n) => String(n).padStart(2, '0');
   const hhmmss = timeStr || `${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
   const paramStr = params && params.length > 0 ? `,${params.join(',')}` : '';
-  return `*HQ,${imei},${cmd},${hhmmss}${paramStr}#\r\n`;
+  return sanitizeCommandString(`*HQ,${imei},${cmd},${hhmmss}${paramStr}#`);
 }
 
 /**
  * Send a raw command directly to a connected tracker over TCP without builder transformation.
- * Simply trims the raw command string, ensures CRLF, and writes directly to socket.
+ * Cleans any escaped \\r\\n, ensures standard CRLF, and writes directly to socket.
  *
  * @param {string} imei
  * @param {string} rawCommand
@@ -146,8 +243,7 @@ function sendRawDeviceCommand(imei, rawCommand) {
     });
   }
 
-  const trimmed = typeof rawCommand === 'string' ? rawCommand.trim() : String(rawCommand).trim();
-  const commandString = trimmed.endsWith('\r\n') ? trimmed : (trimmed.endsWith('\n') ? `${trimmed.slice(0, -1)}\r\n` : `${trimmed}\r\n`);
+  const commandString = sanitizeCommandString(rawCommand);
   const hex = Buffer.from(commandString).toString('hex');
 
   return new Promise((resolve) => {
@@ -202,19 +298,20 @@ function sendRawDeviceCommand(imei, rawCommand) {
 }
 
 /**
- * Send a Cantrack command to a connected tracker over TCP
+ * Send a command (Secumore hashtag format or Cantrack HQ format) to a connected tracker over TCP
  *
  * @param {string} imei
- * @param {string} commandOrCmd  Command code (e.g. 'WKMD', 'D1', 'S20') OR full raw string
+ * @param {string} commandOrCmd  Command code or name (e.g. 'stopoil', 'supplyoil', 'at', 'WKMD', 'D1', 'S20') OR full raw string
  * @param {Array<string|number>} [params=[]]
+ * @param {object} [options={}]
  * @returns {Promise<{ success: boolean, message?: string, error?: string, imei: string, command?: string }>}
  */
-function sendDeviceCommand(imei, commandOrCmd, params = []) {
+function sendDeviceCommand(imei, commandOrCmd, params = [], options = {}) {
   if (!imei) {
     return Promise.resolve({ success: false, error: 'IMEI is required', imei });
   }
 
-  // If already a raw command string (starts with '*', '#', 'HQ,' or ends with '#'), delegate directly to sendRawDeviceCommand
+  // If already a raw command string (starts with '*', '#', 'HQ,' or ends with '#'), sanitize and send directly
   if (typeof commandOrCmd === 'string' && (commandOrCmd.startsWith('*') || commandOrCmd.startsWith('#') || commandOrCmd.startsWith('HQ,') || commandOrCmd.endsWith('#'))) {
     return sendRawDeviceCommand(imei, commandOrCmd);
   }
@@ -229,8 +326,25 @@ function sendDeviceCommand(imei, commandOrCmd, params = []) {
     });
   }
 
-  const cmdCode = commandOrCmd;
-  const commandString = buildCantrackCommand(imei, commandOrCmd, params);
+  const secumoreNames = [
+    'stopoil', 'cut-fuel', 'cut_fuel', 'stopelec', 'cut-elec', 'cut_elec',
+    'supplyoil', 'resume-fuel', 'resume_fuel', 'restore-fuel', 'restore_fuel', 'supplyelec',
+    'at', 'interval', 'set-interval', 'tracker', 'continuous', 'realtime',
+    'begin', 'restart', 'reset', 'speed', 'overspeed', 'nospeed', 'clear-speed',
+    'acc', 'admin', 'noadmin', 'timezone', 'monitor', 'call',
+  ];
+
+  let commandString;
+  let cmdCode = commandOrCmd;
+  const password = options.password || (typeof params[0] === 'string' && params.length === 1 && /^\d{6}$/.test(params[0]) ? params[0] : (process.env.TRACKER_DEFAULT_PASSWORD || '123456'));
+
+  if (typeof commandOrCmd === 'string' && secumoreNames.includes(commandOrCmd.toLowerCase())) {
+    commandString = buildSecumoreCommand(commandOrCmd, password, params);
+  } else {
+    commandString = buildCantrackCommand(imei, commandOrCmd, params);
+  }
+
+  commandString = sanitizeCommandString(commandString);
   const hex = Buffer.from(commandString).toString('hex');
 
   return new Promise((resolve) => {
@@ -285,8 +399,8 @@ function sendDeviceCommand(imei, commandOrCmd, params = []) {
 }
 
 /**
- * Enforce continuous tracking mode (Mode 0) and 30s interval on the tracker.
- * Prevents the tracker firmware from entering deep sleep when vehicle ACC is off.
+ * Enforce continuous tracking mode and 30s interval on the tracker.
+ * Sends both Secumore (#tracker#123456# / #at#30#sum#0#) and Cantrack commands.
  *
  * @param {net.Socket} socket
  * @param {string} imei
@@ -302,26 +416,26 @@ function enforceContinuousTracking(socket, imei) {
   }
 
   trackerState.lastEnforceAt = now;
+  const defaultPassword = process.env.TRACKER_DEFAULT_PASSWORD || '123456';
 
-  // Step 1: Set Working Mode to 0 (GPS Real-time Tracking, GPS kept open)
-  const wkmdCmd = buildCantrackCommand(imei, 'WKMD', ['0']);
-  socket.write(wkmdCmd, () => {
-    logger.info('HQ_AUTO_ENFORCE_WKMD', {
+  // Step 1: Set Tracker Mode (#tracker#123456#)
+  const trackerCmd = sanitizeCommandString(`#tracker#${defaultPassword}#`);
+  socket.write(trackerCmd, () => {
+    logger.info('HQ_AUTO_ENFORCE_TRACKER_MODE', {
       imei,
-      mode: '0 (GPS Real-time Tracking)',
-      command: wkmdCmd.trim(),
+      command: trackerCmd.trim(),
     });
   });
 
-  // Step 2: Set GPRS reporting interval to 30 seconds
+  // Step 2: Set GPRS reporting interval to 30 seconds (#at#30#sum#0#)
   setTimeout(() => {
     if (socket && !socket.destroyed) {
-      const d1Cmd = buildCantrackCommand(imei, 'D1', ['30']);
-      socket.write(d1Cmd, () => {
+      const atCmd = sanitizeCommandString('#at#30#sum#0#');
+      socket.write(atCmd, () => {
         logger.info('HQ_AUTO_ENFORCE_INTERVAL', {
           imei,
           intervalSeconds: 30,
-          command: d1Cmd.trim(),
+          command: atCmd.trim(),
         });
       });
     }
@@ -1097,6 +1211,36 @@ function handleHqPacket(socket, message, state) {
     });
   }
 
+  // Handle Secumore command responses (e.g. #stopoil#OK# or #at#OK# or #supplyoil#OK#)
+  if (typeof message === 'string' && message.startsWith('#')) {
+    const cleanSecumore = message.replace(/[#\r\n]+/g, '#').trim();
+    const parts = cleanSecumore.split('#').filter(Boolean);
+    const cmdConfirmed = parts[0] || 'CMD';
+    const status = parts[1] || 'OK';
+    const imei = (state && state.imei) || (socket._trackerState && socket._trackerState.imei) || 'unknown';
+
+    logger.info('SECUMORE_COMMAND_CONFIRM', {
+      event: 'SECUMORE_COMMAND_CONFIRM',
+      protocol: 'HQ',
+      imei,
+      cmdConfirmed,
+      status,
+      raw: message.trim(),
+      remote: `${socket.remoteAddress}:${socket.remotePort}`,
+    });
+
+    gpsEventEmitter.emit('gps:confirm', {
+      event: 'HQ_COMMAND_CONFIRM',
+      protocol: 'HQ',
+      imei,
+      cmdConfirmed,
+      status,
+      raw: message.trim(),
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
   const parsed = parseHqMessage(message);
   if (!parsed) {
     logger.warn('HQ_INVALID_PACKET', {
@@ -1513,6 +1657,8 @@ module.exports = {
   handleHqPacket,
   handleGt06Packet,
   buildCantrackCommand,
+  buildSecumoreCommand,
+  sanitizeCommandString,
   sendDeviceCommand,
   sendRawDeviceCommand,
   enforceContinuousTracking,

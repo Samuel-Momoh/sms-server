@@ -8,6 +8,8 @@ const {
   sendRawDeviceCommand,
   isDeviceConnected,
   buildCantrackCommand,
+  buildSecumoreCommand,
+  sanitizeCommandString,
   updateDeviceState,
   deviceRegistry,
   deviceStates,
@@ -528,24 +530,49 @@ router.post('/command/:imei/:cmd', requireDeviceAccess, async (req, res) => {
 
   let cmdCode = cmd;
   let params = [];
+  const defaultPassword = body.password || body.trackerPassword || '123456';
 
   switch (cmd) {
     case 'cut_fuel':
     case 'cut-fuel':
-      cmdCode = 'S20';
-      params = [1, 1];
-      break;
+    case 'stopoil':
+      cmdCode = buildSecumoreCommand('stopoil', defaultPassword);
+      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
+    case 'cut_elec':
+    case 'cut-elec':
+    case 'stopelec':
+      cmdCode = buildSecumoreCommand('stopelec', defaultPassword);
+      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
     case 'resume_fuel':
     case 'resume-fuel':
     case 'restore-fuel':
     case 'restore_fuel':
-      cmdCode = 'S20';
-      params = [1, 0];
-      break;
+    case 'supplyoil':
+      cmdCode = buildSecumoreCommand('supplyoil', defaultPassword);
+      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
+    case 'resume_elec':
+    case 'resume-elec':
+    case 'restore_elec':
+    case 'restore-elec':
+    case 'supplyelec':
+      cmdCode = buildSecumoreCommand('supplyelec', defaultPassword);
+      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
     case 'restart':
-      cmdCode = 'R1';
-      params = [];
-      break;
+    case 'reset':
+    case 'begin':
+      cmdCode = buildSecumoreCommand('begin', defaultPassword);
+      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
+    case 'set_upload_interval':
+    case 'set-upload-interval':
+    case 'interval':
+    case 'at':
+      cmdCode = buildSecumoreCommand('at', defaultPassword, [body.interval || body.intervalSeconds || 30]);
+      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
+    case 'set_tracker_mode':
+    case 'set-tracker-mode':
+    case 'tracker':
+      cmdCode = buildSecumoreCommand('tracker', defaultPassword);
+      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
     case 'set_apn':
     case 'set-apn':
       cmdCode = 'S24';
@@ -573,14 +600,14 @@ router.post('/command/:imei/:cmd', requireDeviceAccess, async (req, res) => {
       break;
     case 'set_speed_alarm':
     case 'set-speed-alarm':
-      cmdCode = 'S33';
-      params = [body.speedLimit || body.speed || 80];
-      break;
+    case 'speed':
+      cmdCode = buildSecumoreCommand('speed', defaultPassword, [body.speedLimit || body.speed || 80]);
+      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
     case 'clear_speed_alarm':
     case 'clear-speed-alarm':
-      cmdCode = 'S33';
-      params = [0];
-      break;
+    case 'nospeed':
+      cmdCode = buildSecumoreCommand('nospeed', defaultPassword);
+      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
     case 'set_geofence':
     case 'set-geofence':
       cmdCode = 'S21';
@@ -593,9 +620,9 @@ router.post('/command/:imei/:cmd', requireDeviceAccess, async (req, res) => {
       break;
     case 'set_time_zone':
     case 'set-time-zone':
-      cmdCode = 'S71';
-      params = [body.timezone || 'E00'];
-      break;
+    case 'timezone':
+      cmdCode = buildSecumoreCommand('timezone', defaultPassword, [body.direction || 'E', body.hours || 0, body.minutes || 0]);
+      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
     case 'check_location':
     case 'check-location':
       cmdCode = 'D2';
@@ -610,11 +637,6 @@ router.post('/command/:imei/:cmd', requireDeviceAccess, async (req, res) => {
     case 'check-params':
       cmdCode = 'S26';
       params = [1];
-      break;
-    case 'set_upload_interval':
-    case 'set-upload-interval':
-      cmdCode = 'D1';
-      params = [body.interval || 30];
       break;
     case 'set_power_alarm':
     case 'set-power-alarm':
@@ -632,7 +654,7 @@ router.post('/command/:imei/:cmd', requireDeviceAccess, async (req, res) => {
       params = [];
       break;
     case 'raw':
-      cmdCode = body.rawCommand || body.command || body.raw || '';
+      cmdCode = sanitizeCommandString(body.rawCommand || body.command || body.raw || '');
       params = Array.isArray(body.params) ? body.params : [];
       return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
     default:
@@ -651,26 +673,29 @@ router.post('/devices/:imei/password', requireDeviceAccess, async (req, res) => 
   if (!newPassword) {
     return res.status(400).json({ success: false, error: 'newPassword is required' });
   }
-  return dispatchOrQueue(imei, 'S1', [oldPassword, newPassword], req, res);
+  const cmdStr = buildSecumoreCommand('password', oldPassword, [oldPassword, newPassword]);
+  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
 });
 
 router.post('/devices/:imei/center-number', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const { number } = req.body || {};
+  const { number, password = '123456' } = req.body || {};
   if (!number) {
     return res.status(400).json({ success: false, error: 'number is required' });
   }
-  return dispatchOrQueue(imei, 'S2', [number], req, res);
+  const cmdStr = buildSecumoreCommand('admin', password, [number]);
+  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
 });
 
 router.post('/devices/:imei/admin-numbers', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const { numbers = [] } = req.body || {};
+  const { numbers = [], password = '123456' } = req.body || {};
   const numList = Array.isArray(numbers) ? numbers : [numbers];
   if (numList.length === 0 || !numList[0]) {
     return res.status(400).json({ success: false, error: 'numbers array (up to 5 phone numbers) is required' });
   }
-  return dispatchOrQueue(imei, 'S3', numList.slice(0, 5), req, res);
+  const cmdStr = buildSecumoreCommand('admin', password, [numList[0]]);
+  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
 });
 
 router.post('/devices/:imei/alarm-mode', requireDeviceAccess, async (req, res) => {
@@ -690,12 +715,16 @@ router.post(['/devices/:imei/alarm-type', '/devices/:imei/alarm-types'], require
 
 router.post('/devices/:imei/cut-fuel', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  return dispatchOrQueue(imei, 'S20', [1, 1], req, res);
+  const password = req.body?.password || req.body?.trackerPassword || '123456';
+  const cmdStr = buildSecumoreCommand('stopoil', password);
+  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
 });
 
 router.post(['/devices/:imei/resume-fuel', '/devices/:imei/restore-fuel'], requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  return dispatchOrQueue(imei, 'S20', [1, 0], req, res);
+  const password = req.body?.password || req.body?.trackerPassword || '123456';
+  const cmdStr = buildSecumoreCommand('supplyoil', password);
+  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
 });
 
 router.post('/devices/:imei/geofence', requireDeviceAccess, async (req, res) => {
@@ -727,7 +756,9 @@ router.post('/devices/:imei/apn', requireDeviceAccess, async (req, res) => {
 
 router.post('/devices/:imei/factory-reset', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  return dispatchOrQueue(imei, 'S25', [], req, res);
+  const password = req.body?.password || '123456';
+  const cmdStr = buildSecumoreCommand('begin', password);
+  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
 });
 
 router.post('/devices/:imei/read-state', requireDeviceAccess, async (req, res) => {
@@ -738,8 +769,11 @@ router.post('/devices/:imei/read-state', requireDeviceAccess, async (req, res) =
 
 router.post('/devices/:imei/overspeed', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const { speedKmh = 0 } = req.body || {};
-  return dispatchOrQueue(imei, 'S33', [speedKmh], req, res);
+  const { speedKmh = 0, password = '123456' } = req.body || {};
+  const cmdStr = speedKmh > 0
+    ? buildSecumoreCommand('speed', password, [speedKmh])
+    : buildSecumoreCommand('nospeed', password);
+  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
 });
 
 router.post('/devices/:imei/check-lbs', requireDeviceAccess, async (req, res) => {
@@ -750,9 +784,10 @@ router.post('/devices/:imei/check-lbs', requireDeviceAccess, async (req, res) =>
 
 router.post('/devices/:imei/interval', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const { intervalSeconds = 30 } = req.body || {};
-  const interval = parseInt(intervalSeconds, 10) || 30;
-  return dispatchOrQueue(imei, 'D1', [interval], req, res);
+  const { intervalSeconds = 30, interval = 30 } = req.body || {};
+  const secs = parseInt(intervalSeconds || interval, 10) || 30;
+  const cmdStr = buildSecumoreCommand('at', null, [secs]);
+  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
 });
 
 router.post('/devices/:imei/fast-locate', requireDeviceAccess, async (req, res) => {
@@ -764,20 +799,16 @@ router.post('/devices/:imei/fast-locate', requireDeviceAccess, async (req, res) 
 
 router.post('/devices/:imei/restart', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  return dispatchOrQueue(imei, 'R1', [], req, res);
+  const password = req.body?.password || '123456';
+  const cmdStr = buildSecumoreCommand('begin', password);
+  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
 });
 
 router.post('/devices/:imei/working-mode', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const { mode = 0 } = req.body || {};
-  const modeNum = parseInt(mode, 10);
-  if (![0, 1, 2, 3].includes(modeNum)) {
-    return res.status(400).json({
-      success: false,
-      error: 'Invalid mode. For G01/G02: 0 (Real-time 10s), 1 (LBS Power-saving 600s), 2 (Intelligent 5min)',
-    });
-  }
-  return dispatchOrQueue(imei, 'WKMD', [modeNum], req, res);
+  const password = req.body?.password || '123456';
+  const cmdStr = buildSecumoreCommand('tracker', password);
+  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
 });
 
 router.post('/devices/:imei/raw', requireDeviceAccess, async (req, res) => {
@@ -785,9 +816,10 @@ router.post('/devices/:imei/raw', requireDeviceAccess, async (req, res) => {
   const { command, rawCommand, raw, params = [] } = req.body || {};
   const cmdToSend = rawCommand || command || raw;
   if (!cmdToSend) {
-    return res.status(400).json({ success: false, error: 'command or rawCommand is required (e.g. "HQ,867232054850970,S20,195440,1,1#", "*HQ,...#", or "WKMD")' });
+    return res.status(400).json({ success: false, error: 'command or rawCommand is required (e.g. "#stopoil#123456#", "#supplyoil#123456#", "#at#30#sum#0#")' });
   }
-  return dispatchOrQueue(imei, cmdToSend, params, req, res, sendRawDeviceCommand);
+  const cleanCmd = sanitizeCommandString(cmdToSend);
+  return dispatchOrQueue(imei, cleanCmd, params, req, res, sendRawDeviceCommand);
 });
 
 // ── Queue Management Endpoints ───────────────────────────────────────────────

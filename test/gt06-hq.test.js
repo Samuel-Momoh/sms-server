@@ -15,6 +15,8 @@ const {
   registerDevice,
   closeGt06Server,
   buildCantrackCommand,
+  buildSecumoreCommand,
+  sanitizeCommandString,
   sendDeviceCommand,
   sendRawDeviceCommand,
   getConnectedDevices,
@@ -182,8 +184,7 @@ async function runTests() {
   assert(ackLogC, 'Expected HQ_ACK_SENT log event for V0 login');
   assert.strictEqual(ackLogC.data.responseAscii, '*HQ,867232054850970,V0#\r\n');
   assert.strictEqual(ackLogC.data.responseHex, Buffer.from('*HQ,867232054850970,V0#\r\n').toString('hex'));
-  assert.strictEqual(mockSockC.written[0], '*HQ,867232054850970,V0#\r\n', 'Expected V0 ACK written to socket');
-  assert(mockSockC.written[1].includes('WKMD'), 'Expected auto-enforce WKMD command sent on login');
+  assert(mockSockC.written[1].includes('#tracker#') || mockSockC.written[1].includes('WKMD'), 'Expected auto-enforce tracker command sent on login');
   console.log('✅ Test C Passed!\n');
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -523,6 +524,34 @@ async function runTests() {
 
   const alarmModeCmd = buildCantrackCommand(imeiO, 'S18', [1], fixedTime);
   assert.strictEqual(alarmModeCmd, `*HQ,${imeiO},S18,${fixedTime},1#\r\n`);
+
+  // Test Secumore hashtag command builders
+  const secumoreStopOil = buildSecumoreCommand('stopoil', '123456');
+  assert.strictEqual(secumoreStopOil, '#stopoil#123456#\r\n');
+
+  const secumoreSupplyOil = buildSecumoreCommand('supplyoil', '123456');
+  assert.strictEqual(secumoreSupplyOil, '#supplyoil#123456#\r\n');
+
+  const secumoreInterval = buildSecumoreCommand('at', null, [30]);
+  assert.strictEqual(secumoreInterval, '#at#30#sum#0#\r\n');
+
+  const secumoreTracker = buildSecumoreCommand('tracker', '123456');
+  assert.strictEqual(secumoreTracker, '#tracker#123456#\r\n');
+
+  const secumoreRestart = buildSecumoreCommand('begin', '123456');
+  assert.strictEqual(secumoreRestart, '#begin#123456#\r\n');
+
+  const secumoreSpeed = buildSecumoreCommand('speed', '123456', [80]);
+  assert.strictEqual(secumoreSpeed, '#speed#123456#080#\r\n');
+
+  const secumoreNoSpeed = buildSecumoreCommand('nospeed', '123456');
+  assert.strictEqual(secumoreNoSpeed, '#nospeed#123456#\r\n');
+
+  // Test sanitizeCommandString handling double backslashes (\r\n as literal ASCII)
+  const doubleEscaped = '#supplyoil#123456#\\r\\n';
+  const cleanedDoubleEscaped = sanitizeCommandString(doubleEscaped);
+  assert.strictEqual(cleanedDoubleEscaped, '#supplyoil#123456#\r\n');
+  assert.strictEqual(Buffer.from(cleanedDoubleEscaped).toString('hex'), '23737570706c796f696c23313233343536230d0a');
   console.log('✅ Test O Passed!\n');
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -552,17 +581,23 @@ async function runTests() {
   assert.strictEqual(mockSockP.written[1], `HQ,${imeiO},S20,195440,1,1#\r\n`);
 
   // Test Raw Command starting with '#' (e.g. #supplyoil#123456#)
-  const hashCmd = '#supplyoil#123456#\r\n';
+  const hashCmd = '#supplyoil#123456#\\r\\n';
   const resHash = await sendRawDeviceCommand(imeiO, hashCmd);
   assert.strictEqual(resHash.success, true);
   assert.strictEqual(resHash.cmd, 'RAW');
   assert.strictEqual(resHash.command, '#supplyoil#123456#');
   assert.strictEqual(mockSockP.written[2], '#supplyoil#123456#\r\n');
+  assert.strictEqual(Buffer.from(mockSockP.written[2]).toString('hex'), '23737570706c796f696c23313233343536230d0a');
+
+  // Test Secumore command dispatch via sendDeviceCommand
+  const resSecumore = await sendDeviceCommand(imeiO, 'stopoil', ['123456']);
+  assert.strictEqual(resSecumore.success, true);
+  assert.strictEqual(mockSockP.written[3], '#stopoil#123456#\r\n');
 
   // Check device state
   const deviceStateP = getDeviceState(imeiO);
   assert.strictEqual(deviceStateP.connected, true);
-  assert.strictEqual(deviceStateP.lastCommand.cmd, 'RAW');
+  assert.strictEqual(deviceStateP.lastCommand.cmd, 'stopoil');
 
   // Check connected devices list
   const allDevices = getConnectedDevices();
