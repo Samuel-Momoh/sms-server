@@ -104,7 +104,7 @@ function getDeviceState(imei) {
 
 /**
  * Sanitize and clean a command string to avoid double-escaped literal \\r\\n (hex 5c725c6e)
- * and ensure it is terminated with standard CRLF (\\r\\n / 0x0D 0x0A).
+ * and ensure it ends strictly with the protocol delimiter '#' without any trailing CRLF.
  *
  * @param {string} cmd
  * @returns {string}
@@ -115,93 +115,35 @@ function sanitizeCommandString(cmd) {
   str = str.trim();
   // Strip any literal escaped backslashes \\r, \\n, or actual CRLF from ends
   str = str.replace(/(\\r|\\n|\r|\n)+$/g, '').replace(/^(\\r|\\n|\r|\n)+/g, '').trim();
-  return `${str}\r\n`;
+  return str;
 }
 
 /**
- * Build a Secumore hashtag command string
+ * Build a Cantrack ASCII command string strictly adhering to
+ * Shenzhen Cantrack Technology Co., Ltd (A/1 Protocol Specification):
+ * Format: *HQ,<IMEI>,<CMD>,<HHMMSS>,<PARA1>,<PARA2>,...#
+ * Delimiter: '#' (No CRLF)
  *
- * @param {string} cmd  Command name (e.g. 'stopoil', 'supplyoil', 'at', 'tracker', 'begin', 'speed', 'nospeed', 'ACC', 'admin', 'noadmin', 'password', 'timezone', 'monitor', 'call')
- * @param {string} [password='123456']
- * @param {Array<string|number>} [params=[]]
- * @returns {string}
- */
-function buildSecumoreCommand(cmd, password = '123456', params = []) {
-  const cleanCmd = String(cmd || '').replace(/^#+|#+$/g, '').toLowerCase();
-  const pwd = password || process.env.TRACKER_DEFAULT_PASSWORD || '123456';
-
-  switch (cleanCmd) {
-    case 'stopoil':
-    case 'cut-fuel':
-    case 'cut_fuel':
-      return sanitizeCommandString(`#stopoil#${pwd}#`);
-    case 'stopelec':
-    case 'cut-elec':
-    case 'cut_elec':
-      return sanitizeCommandString(`#stopelec#${pwd}#`);
-    case 'supplyoil':
-    case 'resume-fuel':
-    case 'resume_fuel':
-    case 'restore-fuel':
-    case 'restore_fuel':
-      return sanitizeCommandString(`#supplyoil#${pwd}#`);
-    case 'supplyelec':
-    case 'resume-elec':
-    case 'restore-elec':
-      return sanitizeCommandString(`#supplyelec#${pwd}#`);
-    case 'at':
-    case 'interval':
-    case 'set-interval':
-      const intervalSecs = params && params[0] !== undefined ? params[0] : 30;
-      return sanitizeCommandString(`#at#${intervalSecs}#sum#0#`);
-    case 'tracker':
-    case 'continuous':
-    case 'realtime':
-      return sanitizeCommandString(`#tracker#${pwd}#`);
-    case 'begin':
-    case 'restart':
-    case 'reset':
-      return sanitizeCommandString(`#begin#${pwd}#`);
-    case 'speed':
-    case 'overspeed':
-      const speedVal = String(params && params[0] !== undefined ? params[0] : 80).padStart(3, '0');
-      return sanitizeCommandString(`#speed#${pwd}#${speedVal}#`);
-    case 'nospeed':
-    case 'clear-speed':
-      return sanitizeCommandString(`#nospeed#${pwd}#`);
-    case 'acc':
-      const state = String((params && params[0]) || 'ON').toUpperCase();
-      return sanitizeCommandString(`#ACC#${state}#`);
-    case 'admin':
-      const adminPhone = (params && params[0]) || '';
-      return sanitizeCommandString(`#admin#${pwd}#${adminPhone}#`);
-    case 'noadmin':
-      const delPhone = (params && params[0]) || '';
-      return sanitizeCommandString(`#noadmin#${pwd}#${delPhone}#`);
-    case 'password':
-      const oldPwd = (params && params[0]) || pwd;
-      const newPwd = (params && params[1]) || '123456';
-      return sanitizeCommandString(`#password#${oldPwd}#${newPwd}#`);
-    case 'timezone':
-      const dir = (params && params[0]) || 'E';
-      const hr = (params && params[1]) || 0;
-      const min = (params && params[2]) || 0;
-      return sanitizeCommandString(`#timezone#${pwd}#${dir}#${hr}#${min}#`);
-    case 'monitor':
-      return sanitizeCommandString(`#monitor#${pwd}#`);
-    case 'call':
-      return sanitizeCommandString(`#call#${pwd}#`);
-    default:
-      if (cmd.startsWith('#') && cmd.endsWith('#')) {
-        return sanitizeCommandString(cmd);
-      }
-      return sanitizeCommandString(`#${cmd}#${pwd}#`);
-  }
-}
-
-/**
- * Build a Cantrack ASCII command string according to Section A.1:
- * Format: *HQ,<IMEI>,<CMD>,<HHMMSS>,<PARAM1>,<PARAM2>,...#\r\n
+ * Supported Commands (Sections B.1 to B.17):
+ *  1. S1   – Change Password (old_password, new_password)
+ *  2. S2   – Set Center Number (cnum_address)
+ *  3. S3   – Set Admin Numbers (admin1, admin2... admin5)
+ *  4. S18  – Set Alarm Mode (S: 0=Close, 1=SMS, 2=Call Center)
+ *  5. S19  – Alarm Type Setting (N: 0=Power cut, 1=ACC, 2=Low bat, 3=Vibrate, 4=Removal; E: 1=Open, 0=Close)
+ *  6. S20  – Remote Disable/Enable Fuel or Electricity (C, time1):
+ *            - Disable Fuel (Cut):    *HQ,IMEI,S20,HHMMSS,1,1#
+ *            - Enable Fuel (Restore): *HQ,IMEI,S20,HHMMSS,1,0#
+ *  7. S21  – Set Geo-fence Alarm (radius_value, C: 1=Out, 2=In, 3=Out & In)
+ *  8. S23  – Set IP Port (IP_addr with commas, Port)
+ *  9. S24  – Set APN (APN, APN_name, APN_password)
+ * 10. S25  – Factory Default Settings (*HQ,IMEI,S25,HHMMSS#)
+ * 11. S26  – Read Device's State (W: 0=basic, 1=software version, 2=other)
+ * 12. S33  – Overspeed Setting Alarm (speed in km/h, 0=close)
+ * 13. S80  – Check LBS Command (Base_Number: 00-99)
+ * 14. D1   – Set GPRS Interval Time (interval in seconds)
+ * 15. D2   – Fast Locate in LBS Mode (M: open GPS duration in seconds)
+ * 16. R1   – Restart Command (*HQ,IMEI,R1,HHMMSS#)
+ * 17. WKMD – Change Working Mode (N: 0=Real-time 10s, 1=LBS power saving 600s, 2=GPS intelligent 5m)
  *
  * @param {string} imei
  * @param {string} cmd
@@ -213,8 +155,257 @@ function buildCantrackCommand(imei, cmd, params = [], timeStr) {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   const hhmmss = timeStr || `${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
-  const paramStr = params && params.length > 0 ? `,${params.join(',')}` : '';
-  return sanitizeCommandString(`*HQ,${imei},${cmd},${hhmmss}${paramStr}#`);
+  const cleanCmd = String(cmd || '').toUpperCase().trim();
+
+  let finalCmd = cleanCmd;
+  let finalParams = Array.isArray(params) ? [...params] : (params !== undefined && params !== null ? [params] : []);
+
+  switch (cleanCmd) {
+    // 1. Change Password S1
+    case 'S1':
+    case 'PASSWORD':
+    case 'CHANGE-PASSWORD':
+    case 'CHANGE_PASSWORD': {
+      finalCmd = 'S1';
+      const oldPwd = finalParams[0] || '123456';
+      const newPwd = finalParams[1] || '000000';
+      finalParams = [oldPwd, newPwd];
+      break;
+    }
+    // 2. Set Center Number S2
+    case 'S2':
+    case 'CENTER':
+    case 'SET-CENTER':
+    case 'SET_CENTER':
+    case 'SET-CENTER-NUMBER':
+    case 'SET_CENTER_NUMBER': {
+      finalCmd = 'S2';
+      const phone = finalParams[0] || '';
+      finalParams = [phone];
+      break;
+    }
+    // 3. Set Admin Number S3 (Maximum 5 numbers)
+    case 'S3':
+    case 'ADMIN':
+    case 'SET-ADMIN':
+    case 'SET_ADMIN':
+    case 'SET-ADMIN-NUMBERS':
+    case 'SET_ADMIN_NUMBERS':
+    case 'SET-SOS-NUMBERS':
+    case 'SET_SOS_NUMBERS': {
+      finalCmd = 'S3';
+      finalParams = finalParams.slice(0, 5);
+      break;
+    }
+    // 4. Set Alarm Mode S18
+    case 'S18':
+    case 'ALARM-MODE':
+    case 'ALARM_MODE':
+    case 'SET-ALARM-MODE':
+    case 'SET_ALARM_MODE': {
+      finalCmd = 'S18';
+      const mode = finalParams[0] !== undefined ? finalParams[0] : 1;
+      finalParams = [mode];
+      break;
+    }
+    // 5. Alarm Type Setting S19
+    case 'S19':
+    case 'ALARM-TYPE':
+    case 'ALARM_TYPE':
+    case 'SET-ALARM-TYPE':
+    case 'SET_ALARM_TYPE': {
+      finalCmd = 'S19';
+      const n = finalParams[0] !== undefined ? finalParams[0] : 1; // 0:Power cut, 1:ACC, 2:Low battery, 3:Vibrate, 4:Removal
+      const e = finalParams[1] !== undefined ? finalParams[1] : 1; // 1:Open, 0:Close
+      finalParams = [n, e];
+      break;
+    }
+    // 6. Remote Disable/Enable Fuel or Electricity S20
+    case 'S20':
+    case 'CUT-FUEL':
+    case 'CUT_FUEL':
+    case 'STOPOIL':
+    case 'STOPELEC':
+    case 'CUT-ELEC':
+    case 'CUT_ELEC': {
+      finalCmd = 'S20';
+      if (finalParams.length === 0) {
+        finalParams = [1, 1]; // Default static cut
+      } else if (finalParams.length === 1) {
+        if (finalParams[0] === 'dynamic' || finalParams[0] === true) {
+          // Dynamic multi-stage pulse cutoff sequence (Secumore G05 / H02 standard)
+          finalParams = [1, 3, 10, 3, 5, 5, 3, 5, 3, 5, 3, 5];
+        } else if (finalParams[0] === 'static' || finalParams[0] === false) {
+          finalParams = [1, 1];
+        } else {
+          finalParams = [1, finalParams[0]];
+        }
+      }
+      break;
+    }
+    case 'RESUME-FUEL':
+    case 'RESUME_FUEL':
+    case 'RESTORE-FUEL':
+    case 'RESTORE_FUEL':
+    case 'SUPPLYOIL':
+    case 'SUPPLYELEC':
+    case 'RESUME-ELEC':
+    case 'RESUME_ELEC':
+    case 'RESTORE-ELEC':
+    case 'RESTORE_ELEC': {
+      finalCmd = 'S20';
+      finalParams = [1, 0]; // C=1 (Static), time1=0 (Enable fuel)
+      break;
+    }
+    // 7. Set Geo-fence Alarm S21
+    case 'S21':
+    case 'GEOFENCE':
+    case 'SET-GEOFENCE':
+    case 'SET_GEOFENCE': {
+      finalCmd = 'S21';
+      const radius = finalParams[0] !== undefined ? finalParams[0] : 1000;
+      const c = finalParams[1] !== undefined ? finalParams[1] : 1;
+      finalParams = [radius, c];
+      break;
+    }
+    case 'CLEAR-GEOFENCE':
+    case 'CLEAR_GEOFENCE': {
+      finalCmd = 'S21';
+      finalParams = [0, 1];
+      break;
+    }
+    // 8. Set IP Port S23
+    case 'S23':
+    case 'IP-PORT':
+    case 'SET-IP':
+    case 'SET_IP':
+    case 'SERVER-ADDRESS': {
+      finalCmd = 'S23';
+      let ip = String(finalParams[0] || '140.238.88.183').replace(/\./g, ',');
+      let port = finalParams[1] || '5022';
+      finalParams = [ip, port];
+      break;
+    }
+    // 9. Set APN S24
+    case 'S24':
+    case 'APN':
+    case 'SET-APN':
+    case 'SET_APN': {
+      finalCmd = 'S24';
+      const apn = finalParams[0] || '';
+      const user = finalParams[1] || '';
+      const pwd = finalParams[2] || '';
+      finalParams = [apn, user, pwd];
+      break;
+    }
+    // 10. Factory Default Settings S25
+    case 'S25':
+    case 'FACTORY-RESET':
+    case 'FACTORY_RESET':
+    case 'DEFAULT': {
+      finalCmd = 'S25';
+      finalParams = [];
+      break;
+    }
+    // 11. Read Device's State S26
+    case 'S26':
+    case 'READ-STATE':
+    case 'READ_STATE':
+    case 'CHECK-STATUS':
+    case 'CHECK_STATUS':
+    case 'CHECK-PARAMS':
+    case 'CHECK_PARAMS': {
+      finalCmd = 'S26';
+      const w = finalParams[0] !== undefined ? finalParams[0] : 0;
+      finalParams = [w];
+      break;
+    }
+    // 12. Overspeed Setting Alarm S33
+    case 'S33':
+    case 'OVERSPEED':
+    case 'SPEED':
+    case 'SET-SPEED-ALARM':
+    case 'SET_SPEED_ALARM': {
+      finalCmd = 'S33';
+      const spd = finalParams[0] !== undefined ? finalParams[0] : 80;
+      finalParams = [spd];
+      break;
+    }
+    case 'NOSPEED':
+    case 'CLEAR-SPEED':
+    case 'CLEAR_SPEED':
+    case 'CLEAR-SPEED-ALARM':
+    case 'CLEAR_SPEED_ALARM': {
+      finalCmd = 'S33';
+      finalParams = [0];
+      break;
+    }
+    // 13. Check LBS Command S80
+    case 'S80':
+    case 'LBS-CHECK':
+    case 'LBS_CHECK':
+    case 'CHECK-LBS':
+    case 'CHECK_LBS': {
+      finalCmd = 'S80';
+      const baseNum = finalParams[0] !== undefined ? finalParams[0] : 3;
+      finalParams = [baseNum];
+      break;
+    }
+    // 14. Set GPRS Interval Time D1
+    case 'D1':
+    case 'INTERVAL':
+    case 'SET-INTERVAL':
+    case 'SET_INTERVAL':
+    case 'SET-UPLOAD-INTERVAL':
+    case 'SET_UPLOAD_INTERVAL':
+    case 'AT': {
+      finalCmd = 'D1';
+      const interval = finalParams[0] !== undefined ? finalParams[0] : 30;
+      finalParams = [interval];
+      break;
+    }
+    // 15. Fast Locate from GPS Server in LBS Mode D2
+    case 'D2':
+    case 'FAST-LOCATE':
+    case 'FAST_LOCATE':
+    case 'CHECK-LOCATION':
+    case 'CHECK_LOCATION': {
+      finalCmd = 'D2';
+      const m = finalParams[0] !== undefined ? finalParams[0] : 180;
+      finalParams = [m];
+      break;
+    }
+    // 16. Restart Command R1
+    case 'R1':
+    case 'RESTART':
+    case 'RESET':
+    case 'BEGIN': {
+      finalCmd = 'R1';
+      finalParams = [];
+      break;
+    }
+    // 17. Change Working Mode WKMD
+    case 'WKMD':
+    case 'WORKING-MODE':
+    case 'WORKING_MODE':
+    case 'SET-TRACKER-MODE':
+    case 'SET_TRACKER_MODE':
+    case 'TRACKER':
+    case 'CONTINUOUS':
+    case 'REALTIME': {
+      finalCmd = 'WKMD';
+      const n = finalParams[0] !== undefined ? finalParams[0] : 0;
+      finalParams = [n];
+      break;
+    }
+    default: {
+      finalCmd = cleanCmd;
+      break;
+    }
+  }
+
+  const paramStr = finalParams.length > 0 ? `,${finalParams.join(',')}` : '';
+  return sanitizeCommandString(`*HQ,${imei},${finalCmd},${hhmmss}${paramStr}#`);
 }
 
 /**
@@ -298,10 +489,10 @@ function sendRawDeviceCommand(imei, rawCommand) {
 }
 
 /**
- * Send a command (Secumore hashtag format or Cantrack HQ format) to a connected tracker over TCP
+ * Send a Cantrack command to a connected tracker over TCP
  *
  * @param {string} imei
- * @param {string} commandOrCmd  Command code or name (e.g. 'stopoil', 'supplyoil', 'at', 'WKMD', 'D1', 'S20') OR full raw string
+ * @param {string} commandOrCmd  Command code or alias (e.g. 'S20', 'cut-fuel', 'restore-fuel', 'WKMD', 'D1', 'S26', 'R1') OR full raw string
  * @param {Array<string|number>} [params=[]]
  * @param {object} [options={}]
  * @returns {Promise<{ success: boolean, message?: string, error?: string, imei: string, command?: string }>}
@@ -311,8 +502,8 @@ function sendDeviceCommand(imei, commandOrCmd, params = [], options = {}) {
     return Promise.resolve({ success: false, error: 'IMEI is required', imei });
   }
 
-  // If already a raw command string (starts with '*', '#', 'HQ,' or ends with '#'), sanitize and send directly
-  if (typeof commandOrCmd === 'string' && (commandOrCmd.startsWith('*') || commandOrCmd.startsWith('#') || commandOrCmd.startsWith('HQ,') || commandOrCmd.endsWith('#'))) {
+  // If already a raw command string (starts with '*' or 'HQ,', or ends with '#'), sanitize and send directly
+  if (typeof commandOrCmd === 'string' && (commandOrCmd.startsWith('*') || commandOrCmd.startsWith('HQ,') || (commandOrCmd.startsWith('#') && commandOrCmd.endsWith('#')))) {
     return sendRawDeviceCommand(imei, commandOrCmd);
   }
 
@@ -326,26 +517,9 @@ function sendDeviceCommand(imei, commandOrCmd, params = [], options = {}) {
     });
   }
 
-  const secumoreNames = [
-    'stopoil', 'cut-fuel', 'cut_fuel', 'stopelec', 'cut-elec', 'cut_elec',
-    'supplyoil', 'resume-fuel', 'resume_fuel', 'restore-fuel', 'restore_fuel', 'supplyelec',
-    'at', 'interval', 'set-interval', 'tracker', 'continuous', 'realtime',
-    'begin', 'restart', 'reset', 'speed', 'overspeed', 'nospeed', 'clear-speed',
-    'acc', 'admin', 'noadmin', 'timezone', 'monitor', 'call',
-  ];
-
-  let commandString;
-  let cmdCode = commandOrCmd;
-  const password = options.password || (typeof params[0] === 'string' && params.length === 1 && /^\d{6}$/.test(params[0]) ? params[0] : (process.env.TRACKER_DEFAULT_PASSWORD || '123456'));
-
-  if (typeof commandOrCmd === 'string' && secumoreNames.includes(commandOrCmd.toLowerCase())) {
-    commandString = buildSecumoreCommand(commandOrCmd, password, params);
-  } else {
-    commandString = buildCantrackCommand(imei, commandOrCmd, params);
-  }
-
-  commandString = sanitizeCommandString(commandString);
+  const commandString = buildCantrackCommand(imei, commandOrCmd, params);
   const hex = Buffer.from(commandString).toString('hex');
+  const cmdCode = commandOrCmd;
 
   return new Promise((resolve) => {
     socket.write(commandString, (err) => {
@@ -399,8 +573,8 @@ function sendDeviceCommand(imei, commandOrCmd, params = [], options = {}) {
 }
 
 /**
- * Enforce continuous tracking mode and 30s interval on the tracker.
- * Sends both Secumore (#tracker#123456# / #at#30#sum#0#) and Cantrack commands.
+ * Enforce continuous tracking mode (WKMD,0) and 30s interval (D1,30) on the tracker
+ * according to Shenzhen Cantrack Technology Co., Ltd (A/1 Protocol Specification).
  *
  * @param {net.Socket} socket
  * @param {string} imei
@@ -416,26 +590,26 @@ function enforceContinuousTracking(socket, imei) {
   }
 
   trackerState.lastEnforceAt = now;
-  const defaultPassword = process.env.TRACKER_DEFAULT_PASSWORD || '123456';
 
-  // Step 1: Set Tracker Mode (#tracker#123456#)
-  const trackerCmd = sanitizeCommandString(`#tracker#${defaultPassword}#`);
+  // Step 1: Set Working Mode 0 (GPS Real-time tracking mode 10s: *HQ,IMEI,WKMD,HHMMSS,0#)
+  const trackerCmd = buildCantrackCommand(imei, 'WKMD', [0]);
   socket.write(trackerCmd, () => {
-    logger.info('HQ_AUTO_ENFORCE_TRACKER_MODE', {
+    logger.info('HQ_AUTO_ENFORCE_WKMD', {
       imei,
+      mode: '0 (GPS Real-time Tracking)',
       command: trackerCmd.trim(),
     });
   });
 
-  // Step 2: Set GPRS reporting interval to 30 seconds (#at#30#sum#0#)
+  // Step 2: Set GPRS reporting interval to 30 seconds (*HQ,IMEI,D1,HHMMSS,30#)
   setTimeout(() => {
     if (socket && !socket.destroyed) {
-      const atCmd = sanitizeCommandString('#at#30#sum#0#');
-      socket.write(atCmd, () => {
+      const d1Cmd = buildCantrackCommand(imei, 'D1', [30]);
+      socket.write(d1Cmd, () => {
         logger.info('HQ_AUTO_ENFORCE_INTERVAL', {
           imei,
           intervalSeconds: 30,
-          command: atCmd.trim(),
+          command: d1Cmd.trim(),
         });
       });
     }
@@ -897,15 +1071,15 @@ function nmeaToDecimal(nmea, hemisphere) {
 function buildHqAck(imei, cmd, timestamp) {
   if (cmd === 'V1' || cmd === 'V2') {
     const ts = timestamp || formatV1Timestamp();
-    return `*HQ,${imei},V4,V1,${ts}#\r\n`;
+    return `*HQ,${imei},V4,V1,${ts}#`;
   }
   if (cmd === 'V0') {
-    return `*HQ,${imei},V0#\r\n`;
+    return `*HQ,${imei},V0#`;
   }
   if (cmd === 'HTBT') {
-    return `*HQ,${imei},HTBT#\r\n`;
+    return `*HQ,${imei},HTBT#`;
   }
-  return `*HQ,${imei},${cmd}#\r\n`;
+  return `*HQ,${imei},${cmd}#`;
 }
 
 // =============================================================================
@@ -1163,12 +1337,35 @@ function handleHqConfirm(socket, imei, fields, state) {
   else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
 
   const [cmdConfirmed, ...rest] = fields;
+  let status = null;
+  let equStatus = null;
+  let vehicleStatus = null;
+
+  // Check if second field is status flag like DONE, OK, ERROR
+  if (rest.length > 0 && typeof rest[0] === 'string' && /^(DONE|OK|ERROR)/i.test(rest[0])) {
+    status = rest[0].toUpperCase();
+  }
+
+  // Check if last field is an 8-character hex equ_status
+  const lastField = rest[rest.length - 1];
+  if (lastField && typeof lastField === 'string' && /^[0-9A-Fa-f]{8}$/.test(lastField)) {
+    equStatus = lastField;
+    vehicleStatus = parseEquStatus(lastField);
+    updateDeviceState(imei, {
+      vehicleStatus,
+      lastActivityAt: new Date().toISOString(),
+    });
+  }
+
   const payload = {
     event: 'HQ_COMMAND_CONFIRM',
     protocol: 'HQ',
     imei,
     remote: `${socket.remoteAddress}:${socket.remotePort}`,
     cmdConfirmed,
+    status,
+    equStatusHex: equStatus,
+    vehicleStatus,
     details: rest,
     timestamp: new Date().toISOString(),
   };
@@ -1176,6 +1373,8 @@ function handleHqConfirm(socket, imei, fields, state) {
   logger.info('HQ_COMMAND_CONFIRM', payload);
   gpsEventEmitter.emit('gps:confirm', payload);
 }
+
+const buildSecumoreCommand = buildCantrackCommand;
 
 function handleHqWifi(socket, imei, fields, state) {
   if (state) state.lastActivityAt = new Date().toISOString();

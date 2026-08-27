@@ -27,6 +27,7 @@ const {
   findUserByUsername,
   findUserById,
   registerNewDevice,
+  getAllDevices,
   getDeviceByImei,
   getDevicesByUser,
   updateDeviceInfo,
@@ -300,36 +301,78 @@ router.get('/auth/me', (req, res) => {
 
 // ── GET /api/gps/devices ──────────────────────────────────────────────────────
 router.get('/devices', async (req, res) => {
-  const allDevices = getConnectedDevices();
+  try {
+    // 1. Fetch persistent devices from MySQL database
+    const dbDevices = req.user?.role === 'admin'
+      ? await getAllDevices()
+      : await getDevicesByUser(req.user?.id);
 
-  // Admin sees all devices
-  if (req.user?.role === 'admin') {
-    return res.json({
-      success: true,
-      count: allDevices.length,
-      devices: allDevices,
-    });
-  }
-
-  // Regular users only see devices registered to their userId
-  const userId = req.user?.id;
-  const userDbDevices = await getDevicesByUser(userId);
-  const userImeis = new Set(userDbDevices.map((d) => String(d.imei)));
-
-  // Include in-memory device states assigned to this user
-  for (const [imei, state] of deviceStates.entries()) {
-    if (state.userId && String(state.userId) === String(userId)) {
-      userImeis.add(String(imei));
+    // 2. Map of in-memory active TCP sockets & states
+    const memoryStates = new Map();
+    for (const [imei, state] of deviceStates.entries()) {
+      memoryStates.set(String(imei), {
+        ...state,
+        connected: deviceRegistry.has(imei),
+      });
     }
+
+    // 3. Merge database records with in-memory state
+    const mergedMap = new Map();
+
+    // Add all DB devices first
+    for (const d of dbDevices) {
+      const imei = String(d.imei);
+      const memState = memoryStates.get(imei);
+      mergedMap.set(imei, {
+        imei,
+        name: d.name || `Vehicle ${imei.slice(-4)}`,
+        plateNumber: d.plate_number || d.plateNumber || '',
+        simNumber: d.sim_number || d.simNumber || '',
+        model: d.model || 'Cantrack G02',
+        protocol: d.protocol || 'HQ',
+        userId: d.user_id || d.userId || null,
+        icon: d.icon || null,
+        connected: memState ? memState.connected : Boolean(d.connected),
+        lastSeenAt: memState?.lastActivityAt || d.last_seen_at || d.updated_at || null,
+        lastLocation: memState?.lastLocation || {
+          latitude: d.last_latitude ? parseFloat(d.last_latitude) : null,
+          longitude: d.last_longitude ? parseFloat(d.last_longitude) : null,
+          speed_kmh: d.speed_kmh ? parseFloat(d.speed_kmh) : 0,
+          direction: d.direction ? parseInt(d.direction, 10) : 0,
+          gpsStatus: d.gps_status || 'A',
+          timestamp: d.last_seen_at || null,
+        },
+        vehicleStatus: memState?.vehicleStatus || {
+          accOn: Boolean(d.acc_on),
+          isOilCut: Boolean(d.is_oil_cut),
+          isBackupBattery: Boolean(d.is_backup_battery),
+          gpsFixed: d.gps_status === 'A',
+          doorOpen: false,
+          alarms: [],
+        },
+      });
+    }
+
+    // Also include any in-memory devices not yet in DB (e.g. freshly connected)
+    for (const [imei, memState] of memoryStates.entries()) {
+      if (!mergedMap.has(imei)) {
+        if (req.user?.role === 'admin' || (memState.userId && String(memState.userId) === String(req.user?.id))) {
+          mergedMap.set(imei, memState);
+        }
+      }
+    }
+
+    const deviceList = Array.from(mergedMap.values());
+
+    res.json({
+      success: true,
+      count: deviceList.length,
+      devices: deviceList,
+    });
+  } catch (err) {
+    logger.error('GET_DEVICES_ROUTE_ERROR', { error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
-
-  const filteredDevices = allDevices.filter((dev) => userImeis.has(String(dev.imei)));
-
-  res.json({
-    success: true,
-    count: filteredDevices.length,
-    devices: filteredDevices,
-  });
 });
 
 // ── POST /api/gps/devices (Register New Device) ────────────────────────────────
@@ -416,13 +459,48 @@ router.post('/devices', async (req, res) => {
 });
 
 // ── GET /api/gps/devices/:imei ────────────────────────────────────────────────
-router.get('/devices/:imei', requireDeviceAccess, (req, res) => {
+router.get('/devices/:imei', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const device = getDeviceState(imei);
+  let device = getDeviceState(imei);
+  
+  if (!device) {
+    const dbDevice = await getDeviceByImei(imei);
+    if (dbDevice) {
+      device = {
+        imei: String(dbDevice.imei),
+        name: dbDevice.name || `Vehicle ${String(dbDevice.imei).slice(-4)}`,
+        plateNumber: dbDevice.plate_number || dbDevice.plateNumber || '',
+        simNumber: dbDevice.sim_number || dbDevice.simNumber || '',
+        model: dbDevice.model || 'Cantrack G02',
+        protocol: dbDevice.protocol || 'HQ',
+        userId: dbDevice.user_id || dbDevice.userId || null,
+        icon: dbDevice.icon || null,
+        connected: false,
+        lastSeenAt: dbDevice.last_seen_at || dbDevice.updated_at || null,
+        lastLocation: {
+          latitude: dbDevice.last_latitude ? parseFloat(dbDevice.last_latitude) : null,
+          longitude: dbDevice.last_longitude ? parseFloat(dbDevice.last_longitude) : null,
+          speed_kmh: dbDevice.speed_kmh ? parseFloat(dbDevice.speed_kmh) : 0,
+          direction: dbDevice.direction ? parseInt(dbDevice.direction, 10) : 0,
+          gpsStatus: dbDevice.gps_status || 'A',
+          timestamp: dbDevice.last_seen_at || null,
+        },
+        vehicleStatus: {
+          accOn: Boolean(dbDevice.acc_on),
+          isOilCut: Boolean(dbDevice.is_oil_cut),
+          isBackupBattery: Boolean(dbDevice.is_backup_battery),
+          gpsFixed: dbDevice.gps_status === 'A',
+          doorOpen: false,
+          alarms: [],
+        },
+      };
+    }
+  }
+
   if (!device) {
     return res.status(404).json({
       success: false,
-      error: `Device ${imei} not found in registry`,
+      error: `Device ${imei} not found in registry or database`,
       connected: false,
     });
   }
@@ -530,49 +608,55 @@ router.post('/command/:imei/:cmd', requireDeviceAccess, async (req, res) => {
 
   let cmdCode = cmd;
   let params = [];
-  const defaultPassword = body.password || body.trackerPassword || '123456';
 
   switch (cmd) {
     case 'cut_fuel':
     case 'cut-fuel':
     case 'stopoil':
-      cmdCode = buildSecumoreCommand('stopoil', defaultPassword);
-      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
     case 'cut_elec':
     case 'cut-elec':
-    case 'stopelec':
-      cmdCode = buildSecumoreCommand('stopelec', defaultPassword);
-      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
+    case 'stopelec': {
+      cmdCode = 'S20';
+      const isDynamic = body.dynamic !== undefined ? Boolean(body.dynamic) : (body.mode === 'dynamic' || body.long === true);
+      params = Array.isArray(body.params) && body.params.length > 0
+        ? body.params
+        : (isDynamic ? [1, 3, 10, 3, 5, 5, 3, 5, 3, 5, 3, 5] : [1, 1]);
+      break;
+    }
     case 'resume_fuel':
     case 'resume-fuel':
     case 'restore-fuel':
     case 'restore_fuel':
     case 'supplyoil':
-      cmdCode = buildSecumoreCommand('supplyoil', defaultPassword);
-      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
     case 'resume_elec':
     case 'resume-elec':
     case 'restore_elec':
     case 'restore-elec':
     case 'supplyelec':
-      cmdCode = buildSecumoreCommand('supplyelec', defaultPassword);
-      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
+      cmdCode = 'S20';
+      params = [1, 0]; // C=1 (Static), time1=0 (Enable fuel)
+      break;
     case 'restart':
     case 'reset':
     case 'begin':
-      cmdCode = buildSecumoreCommand('begin', defaultPassword);
-      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
+      cmdCode = 'R1';
+      params = [];
+      break;
     case 'set_upload_interval':
     case 'set-upload-interval':
     case 'interval':
     case 'at':
-      cmdCode = buildSecumoreCommand('at', defaultPassword, [body.interval || body.intervalSeconds || 30]);
-      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
+      cmdCode = 'D1';
+      params = [body.interval || body.intervalSeconds || 30];
+      break;
     case 'set_tracker_mode':
     case 'set-tracker-mode':
     case 'tracker':
-      cmdCode = buildSecumoreCommand('tracker', defaultPassword);
-      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
+    case 'working_mode':
+    case 'working-mode':
+      cmdCode = 'WKMD';
+      params = [body.mode !== undefined ? body.mode : 0];
+      break;
     case 'set_apn':
     case 'set-apn':
       cmdCode = 'S24';
@@ -581,35 +665,42 @@ router.post('/command/:imei/:cmd', requireDeviceAccess, async (req, res) => {
     case 'set_ip':
     case 'set-ip':
       cmdCode = 'S23';
-      const rawIp = body.ip || '';
+      const rawIp = body.ip || '140.238.88.183';
       const ipParts = rawIp.includes(',') ? rawIp.split(',')[0].replace(/\./g, ',') : rawIp.replace(/\./g, ',');
       const port = body.port || (rawIp.includes(',') ? rawIp.split(',')[1] : '5022');
       params = [ipParts, port];
       break;
     case 'set_center_number':
     case 'set-center-number':
+    case 'center':
       cmdCode = 'S2';
       params = [body.phoneNumber || body.number || ''];
       break;
     case 'set_sos_numbers':
     case 'set-sos-numbers':
+    case 'admin':
+    case 'set_admin':
       cmdCode = 'S3';
       params = Array.isArray(body.phoneNumbers || body.numbers)
-        ? (body.phoneNumbers || body.numbers)
+        ? (body.phoneNumbers || body.numbers).slice(0, 5)
         : [(body.phoneNumber || body.number || '')];
       break;
     case 'set_speed_alarm':
     case 'set-speed-alarm':
     case 'speed':
-      cmdCode = buildSecumoreCommand('speed', defaultPassword, [body.speedLimit || body.speed || 80]);
-      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
+    case 'overspeed':
+      cmdCode = 'S33';
+      params = [body.speedLimit || body.speed || 80];
+      break;
     case 'clear_speed_alarm':
     case 'clear-speed-alarm':
     case 'nospeed':
-      cmdCode = buildSecumoreCommand('nospeed', defaultPassword);
-      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
+      cmdCode = 'S33';
+      params = [0];
+      break;
     case 'set_geofence':
     case 'set-geofence':
+    case 'geofence':
       cmdCode = 'S21';
       params = [body.radius || 1000, body.mode || 1];
       break;
@@ -618,18 +709,17 @@ router.post('/command/:imei/:cmd', requireDeviceAccess, async (req, res) => {
       cmdCode = 'S21';
       params = [0, 1];
       break;
-    case 'set_time_zone':
-    case 'set-time-zone':
-    case 'timezone':
-      cmdCode = buildSecumoreCommand('timezone', defaultPassword, [body.direction || 'E', body.hours || 0, body.minutes || 0]);
-      return dispatchOrQueue(imei, cmdCode, params, req, res, sendRawDeviceCommand);
     case 'check_location':
     case 'check-location':
+    case 'fast_locate':
+    case 'fast-locate':
       cmdCode = 'D2';
-      params = [180];
+      params = [body.seconds || body.openGpsSeconds || 180];
       break;
     case 'check_status':
     case 'check-status':
+    case 'read_state':
+    case 'read-state':
       cmdCode = 'S26';
       params = [0];
       break;
@@ -637,6 +727,27 @@ router.post('/command/:imei/:cmd', requireDeviceAccess, async (req, res) => {
     case 'check-params':
       cmdCode = 'S26';
       params = [1];
+      break;
+    case 'check_lbs':
+    case 'check-lbs':
+    case 'lbs_check':
+    case 'lbs-check':
+      cmdCode = 'S80';
+      params = [body.baseNumber || body.baseCount || 3];
+      break;
+    case 'set_alarm_mode':
+    case 'set-alarm-mode':
+    case 'alarm_mode':
+    case 'alarm-mode':
+      cmdCode = 'S18';
+      params = [body.mode !== undefined ? body.mode : 1];
+      break;
+    case 'set_alarm_type':
+    case 'set-alarm-type':
+    case 'alarm_type':
+    case 'alarm-type':
+      cmdCode = 'S19';
+      params = [body.alarmType || 1, body.enable !== undefined ? (body.enable ? 1 : 0) : 1];
       break;
     case 'set_power_alarm':
     case 'set-power-alarm':
@@ -652,6 +763,12 @@ router.post('/command/:imei/:cmd', requireDeviceAccess, async (req, res) => {
     case 'factory-reset':
       cmdCode = 'S25';
       params = [];
+      break;
+    case 'change_password':
+    case 'change-password':
+    case 'password':
+      cmdCode = 'S1';
+      params = [body.oldPassword || '123456', body.newPassword || '000000'];
       break;
     case 'raw':
       cmdCode = sanitizeCommandString(body.rawCommand || body.command || body.raw || '');
@@ -673,29 +790,26 @@ router.post('/devices/:imei/password', requireDeviceAccess, async (req, res) => 
   if (!newPassword) {
     return res.status(400).json({ success: false, error: 'newPassword is required' });
   }
-  const cmdStr = buildSecumoreCommand('password', oldPassword, [oldPassword, newPassword]);
-  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
+  return dispatchOrQueue(imei, 'S1', [oldPassword, newPassword], req, res);
 });
 
 router.post('/devices/:imei/center-number', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const { number, password = '123456' } = req.body || {};
+  const { number } = req.body || {};
   if (!number) {
     return res.status(400).json({ success: false, error: 'number is required' });
   }
-  const cmdStr = buildSecumoreCommand('admin', password, [number]);
-  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
+  return dispatchOrQueue(imei, 'S2', [number], req, res);
 });
 
 router.post('/devices/:imei/admin-numbers', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const { numbers = [], password = '123456' } = req.body || {};
+  const { numbers = [] } = req.body || {};
   const numList = Array.isArray(numbers) ? numbers : [numbers];
   if (numList.length === 0 || !numList[0]) {
     return res.status(400).json({ success: false, error: 'numbers array (up to 5 phone numbers) is required' });
   }
-  const cmdStr = buildSecumoreCommand('admin', password, [numList[0]]);
-  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
+  return dispatchOrQueue(imei, 'S3', numList.slice(0, 5), req, res);
 });
 
 router.post('/devices/:imei/alarm-mode', requireDeviceAccess, async (req, res) => {
@@ -715,16 +829,16 @@ router.post(['/devices/:imei/alarm-type', '/devices/:imei/alarm-types'], require
 
 router.post('/devices/:imei/cut-fuel', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const password = req.body?.password || req.body?.trackerPassword || '123456';
-  const cmdStr = buildSecumoreCommand('stopoil', password);
-  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
+  const isDynamic = req.body?.dynamic !== undefined ? Boolean(req.body.dynamic) : (req.body?.mode === 'dynamic' || req.body?.long === true);
+  const params = Array.isArray(req.body?.params) && req.body.params.length > 0
+    ? req.body.params
+    : (isDynamic ? [1, 3, 10, 3, 5, 5, 3, 5, 3, 5, 3, 5] : [1, 1]);
+  return dispatchOrQueue(imei, 'S20', params, req, res);
 });
 
 router.post(['/devices/:imei/resume-fuel', '/devices/:imei/restore-fuel'], requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const password = req.body?.password || req.body?.trackerPassword || '123456';
-  const cmdStr = buildSecumoreCommand('supplyoil', password);
-  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
+  return dispatchOrQueue(imei, 'S20', [1, 0], req, res);
 });
 
 router.post('/devices/:imei/geofence', requireDeviceAccess, async (req, res) => {
@@ -756,9 +870,7 @@ router.post('/devices/:imei/apn', requireDeviceAccess, async (req, res) => {
 
 router.post('/devices/:imei/factory-reset', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const password = req.body?.password || '123456';
-  const cmdStr = buildSecumoreCommand('begin', password);
-  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
+  return dispatchOrQueue(imei, 'S25', [], req, res);
 });
 
 router.post('/devices/:imei/read-state', requireDeviceAccess, async (req, res) => {
@@ -769,11 +881,8 @@ router.post('/devices/:imei/read-state', requireDeviceAccess, async (req, res) =
 
 router.post('/devices/:imei/overspeed', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const { speedKmh = 0, password = '123456' } = req.body || {};
-  const cmdStr = speedKmh > 0
-    ? buildSecumoreCommand('speed', password, [speedKmh])
-    : buildSecumoreCommand('nospeed', password);
-  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
+  const { speedKmh = 0 } = req.body || {};
+  return dispatchOrQueue(imei, 'S33', [speedKmh], req, res);
 });
 
 router.post('/devices/:imei/check-lbs', requireDeviceAccess, async (req, res) => {
@@ -786,8 +895,7 @@ router.post('/devices/:imei/interval', requireDeviceAccess, async (req, res) => 
   const { imei } = req.params;
   const { intervalSeconds = 30, interval = 30 } = req.body || {};
   const secs = parseInt(intervalSeconds || interval, 10) || 30;
-  const cmdStr = buildSecumoreCommand('at', null, [secs]);
-  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
+  return dispatchOrQueue(imei, 'D1', [secs], req, res);
 });
 
 router.post('/devices/:imei/fast-locate', requireDeviceAccess, async (req, res) => {
@@ -799,16 +907,13 @@ router.post('/devices/:imei/fast-locate', requireDeviceAccess, async (req, res) 
 
 router.post('/devices/:imei/restart', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const password = req.body?.password || '123456';
-  const cmdStr = buildSecumoreCommand('begin', password);
-  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
+  return dispatchOrQueue(imei, 'R1', [], req, res);
 });
 
 router.post('/devices/:imei/working-mode', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  const password = req.body?.password || '123456';
-  const cmdStr = buildSecumoreCommand('tracker', password);
-  return dispatchOrQueue(imei, cmdStr, [], req, res, sendRawDeviceCommand);
+  const { mode = 0 } = req.body || {};
+  return dispatchOrQueue(imei, 'WKMD', [mode], req, res);
 });
 
 router.post('/devices/:imei/raw', requireDeviceAccess, async (req, res) => {
@@ -816,7 +921,7 @@ router.post('/devices/:imei/raw', requireDeviceAccess, async (req, res) => {
   const { command, rawCommand, raw, params = [] } = req.body || {};
   const cmdToSend = rawCommand || command || raw;
   if (!cmdToSend) {
-    return res.status(400).json({ success: false, error: 'command or rawCommand is required (e.g. "#stopoil#123456#", "#supplyoil#123456#", "#at#30#sum#0#")' });
+    return res.status(400).json({ success: false, error: 'command or rawCommand is required (e.g. "*HQ,867232054850970,S20,130305,1,1#")' });
   }
   const cleanCmd = sanitizeCommandString(cmdToSend);
   return dispatchOrQueue(imei, cleanCmd, params, req, res, sendRawDeviceCommand);

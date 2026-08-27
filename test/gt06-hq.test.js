@@ -135,20 +135,20 @@ async function runTests() {
   assert.strictEqual(logA.data.latitude, 4.88826);
   assert.strictEqual(logA.data.longitude, 6.913207);
 
-  // Check HQ_ACK_SENT for V1: must be *HQ,<IMEI>,V4,V1,<YYYYMMDD210226>#\r\n
+  // Check HQ_ACK_SENT for V1: must be *HQ,<IMEI>,V4,V1,<YYYYMMDD210226>#
   const ackLogA = capturedLogs.find((l) => l.event === 'HQ_ACK_SENT' && l.data.responseAscii.includes('V4,V1'));
   assert(ackLogA, 'Expected HQ_ACK_SENT log event with V4,V1 confirmation');
   assert.strictEqual(ackLogA.data.imei, '867232054850970');
-  assert(/^\*HQ,867232054850970,V4,V1,\d{8}210226#\r\n$/.test(ackLogA.data.responseAscii), `Response format invalid: ${ackLogA.data.responseAscii}`);
+  assert(/^\*HQ,867232054850970,V4,V1,\d{8}210226#$/.test(ackLogA.data.responseAscii), `Response format invalid: ${ackLogA.data.responseAscii}`);
   assert.strictEqual(ackLogA.data.responseHex, Buffer.from(ackLogA.data.responseAscii).toString('hex'));
   assert.strictEqual(mockSockA.written.length, 1, 'Expected V4 confirmation ACK written to socket');
   console.log('✅ Test A Passed!\n');
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST B: HQ Heartbeat (*HQ,867232054850970,HTBT#\r\n) & verify *HQ,<IMEI>,HTBT# response
+  // TEST B: HQ Heartbeat (*HQ,867232054850970,HTBT#) & verify *HQ,<IMEI>,HTBT# response
   // ───────────────────────────────────────────────────────────────────────────
-  console.log('Test B: Parsing *HQ,867232054850970,HTBT#\\r\\n');
-  const msgB = '*HQ,867232054850970,HTBT#\r\n';
+  console.log('Test B: Parsing *HQ,867232054850970,HTBT#');
+  const msgB = '*HQ,867232054850970,HTBT#';
   const mockSockB = createMockSocket();
   const stateB = { protocol: null, buffer: Buffer.from(msgB) };
   mockSockB._trackerState = stateB;
@@ -161,8 +161,8 @@ async function runTests() {
   const ackLogB = capturedLogs.find((l) => l.event === 'HQ_ACK_SENT' && l.data.responseAscii.includes('HTBT'));
   assert(ackLogB, 'Expected HQ_ACK_SENT log event for HTBT');
   assert.strictEqual(ackLogB.data.imei, '867232054850970');
-  assert.strictEqual(ackLogB.data.responseAscii, '*HQ,867232054850970,HTBT#\r\n');
-  assert.strictEqual(ackLogB.data.responseHex, Buffer.from('*HQ,867232054850970,HTBT#\r\n').toString('hex'));
+  assert.strictEqual(ackLogB.data.responseAscii, '*HQ,867232054850970,HTBT#');
+  assert.strictEqual(ackLogB.data.responseHex, Buffer.from('*HQ,867232054850970,HTBT#').toString('hex'));
   assert.strictEqual(mockSockB.written.length, 1, 'Expected HTBT ACK written to socket');
   console.log('✅ Test B Passed!\n');
 
@@ -182,8 +182,8 @@ async function runTests() {
 
   const ackLogC = capturedLogs.find((l) => l.event === 'HQ_ACK_SENT' && l.data.responseAscii.includes('V0'));
   assert(ackLogC, 'Expected HQ_ACK_SENT log event for V0 login');
-  assert.strictEqual(ackLogC.data.responseAscii, '*HQ,867232054850970,V0#\r\n');
-  assert.strictEqual(ackLogC.data.responseHex, Buffer.from('*HQ,867232054850970,V0#\r\n').toString('hex'));
+  assert.strictEqual(ackLogC.data.responseAscii, '*HQ,867232054850970,V0#');
+  assert.strictEqual(ackLogC.data.responseHex, Buffer.from('*HQ,867232054850970,V0#').toString('hex'));
   assert(mockSockC.written[1].includes('#tracker#') || mockSockC.written[1].includes('WKMD'), 'Expected auto-enforce tracker command sent on login');
   console.log('✅ Test C Passed!\n');
 
@@ -268,7 +268,7 @@ async function runTests() {
   assert.strictEqual(stateG.protocol, 'HQ');
   assert.strictEqual(deviceRegistry.get('867232054850970'), mockSockG);
   assert(mockSockG.written.length >= 1);
-  assert.strictEqual(mockSockG.written[0], '*HQ,867232054850970,V0#\r\n');
+  assert.strictEqual(mockSockG.written[0], '*HQ,867232054850970,V0#');
 
   // Step 2: 6 consecutive V1 updates (representing continuous tracking)
   const timestamps = ['094229', '094259', '094329', '094359', '094429', '094459'];
@@ -457,7 +457,7 @@ async function runTests() {
   // ACK should contain date 20150810145452
   const ackLogL = capturedLogs.find((l) => l.event === 'HQ_ACK_SENT' && l.data.imei === '865205030330012');
   assert(ackLogL, 'Expected ACK sent');
-  assert.strictEqual(ackLogL.data.responseAscii, '*HQ,865205030330012,V4,V1,20150810145452#\r\n');
+  assert.strictEqual(ackLogL.data.responseAscii, '*HQ,865205030330012,V4,V1,20150810145452#');
   console.log('✅ Test L Passed!\n');
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -489,69 +489,87 @@ async function runTests() {
   console.log('✅ Test M Passed!\n');
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST O: Cantrack Command Builders (WKMD, D1, S20, R1, S26, S2, S33, S21, S18)
+  // TEST O: Cantrack Command Builders (All 17 Commands: S1..S33, S80, D1, D2, R1, WKMD)
   // ───────────────────────────────────────────────────────────────────────────
-  console.log('Test O: Cantrack Command Builders');
+  console.log('Test O: Cantrack Command Builders (17 Official Commands)');
   const imeiO = '867232054850970';
   const fixedTime = '120000';
 
-  const wkmdCmd = buildCantrackCommand(imeiO, 'WKMD', [0], fixedTime);
-  assert.strictEqual(wkmdCmd, `*HQ,${imeiO},WKMD,${fixedTime},0#\r\n`);
+  // 1. S1 Change Password
+  const s1Cmd = buildCantrackCommand(imeiO, 'S1', ['123456', '654321'], fixedTime);
+  assert.strictEqual(s1Cmd, `*HQ,${imeiO},S1,${fixedTime},123456,654321#`);
 
+  // 2. S2 Center Number
+  const s2Cmd = buildCantrackCommand(imeiO, 'S2', ['08012345678'], fixedTime);
+  assert.strictEqual(s2Cmd, `*HQ,${imeiO},S2,${fixedTime},08012345678#`);
+
+  // 3. S3 Admin Numbers (up to 5)
+  const s3Cmd = buildCantrackCommand(imeiO, 'S3', ['13800000001', '13800000002'], fixedTime);
+  assert.strictEqual(s3Cmd, `*HQ,${imeiO},S3,${fixedTime},13800000001,13800000002#`);
+
+  // 4. S18 Alarm Mode
+  const s18Cmd = buildCantrackCommand(imeiO, 'S18', [1], fixedTime);
+  assert.strictEqual(s18Cmd, `*HQ,${imeiO},S18,${fixedTime},1#`);
+
+  // 5. S19 Alarm Type
+  const s19Cmd = buildCantrackCommand(imeiO, 'S19', [1, 1], fixedTime);
+  assert.strictEqual(s19Cmd, `*HQ,${imeiO},S19,${fixedTime},1,1#`);
+
+  // 6. S20 Remote Disable / Enable Fuel (Cut / Restore)
+  const s20CutCmd = buildCantrackCommand(imeiO, 'cut-fuel', [], fixedTime);
+  assert.strictEqual(s20CutCmd, `*HQ,${imeiO},S20,${fixedTime},1,1#`);
+
+  const s20RestoreCmd = buildCantrackCommand(imeiO, 'resume-fuel', [], fixedTime);
+  assert.strictEqual(s20RestoreCmd, `*HQ,${imeiO},S20,${fixedTime},1,0#`);
+
+  // 7. S21 Geo-fence Alarm
+  const s21Cmd = buildCantrackCommand(imeiO, 'S21', [1000, 1], fixedTime);
+  assert.strictEqual(s21Cmd, `*HQ,${imeiO},S21,${fixedTime},1000,1#`);
+
+  // 8. S23 IP & Port
+  const s23Cmd = buildCantrackCommand(imeiO, 'S23', ['140.238.88.183', '5022'], fixedTime);
+  assert.strictEqual(s23Cmd, `*HQ,${imeiO},S23,${fixedTime},140,238,88,183,5022#`);
+
+  // 9. S24 APN
+  const s24Cmd = buildCantrackCommand(imeiO, 'S24', ['CMNET', '', ''], fixedTime);
+  assert.strictEqual(s24Cmd, `*HQ,${imeiO},S24,${fixedTime},CMNET,,#`);
+
+  // 10. S25 Factory Default
+  const s25Cmd = buildCantrackCommand(imeiO, 'S25', [], fixedTime);
+  assert.strictEqual(s25Cmd, `*HQ,${imeiO},S25,${fixedTime}#`);
+
+  // 11. S26 Read Device's State
+  const s26Cmd = buildCantrackCommand(imeiO, 'S26', [0], fixedTime);
+  assert.strictEqual(s26Cmd, `*HQ,${imeiO},S26,${fixedTime},0#`);
+
+  // 12. S33 Overspeed Alarm
+  const s33Cmd = buildCantrackCommand(imeiO, 'S33', [80], fixedTime);
+  assert.strictEqual(s33Cmd, `*HQ,${imeiO},S33,${fixedTime},80#`);
+
+  // 13. S80 Check LBS Command
+  const s80Cmd = buildCantrackCommand(imeiO, 'S80', [3], fixedTime);
+  assert.strictEqual(s80Cmd, `*HQ,${imeiO},S80,${fixedTime},3#`);
+
+  // 14. D1 Set GPRS Interval
   const d1Cmd = buildCantrackCommand(imeiO, 'D1', [30], fixedTime);
-  assert.strictEqual(d1Cmd, `*HQ,${imeiO},D1,${fixedTime},30#\r\n`);
+  assert.strictEqual(d1Cmd, `*HQ,${imeiO},D1,${fixedTime},30#`);
 
-  const cutFuelCmd = buildCantrackCommand(imeiO, 'S20', [1, 3, 10, 3, 5, 5, 7], fixedTime);
-  assert.strictEqual(cutFuelCmd, `*HQ,${imeiO},S20,${fixedTime},1,3,10,3,5,5,7#\r\n`);
+  // 15. D2 Fast Locate LBS Mode
+  const d2Cmd = buildCantrackCommand(imeiO, 'D2', [180], fixedTime);
+  assert.strictEqual(d2Cmd, `*HQ,${imeiO},D2,${fixedTime},180#`);
 
-  const restoreFuelCmd = buildCantrackCommand(imeiO, 'S20', [1, 0], fixedTime);
-  assert.strictEqual(restoreFuelCmd, `*HQ,${imeiO},S20,${fixedTime},1,0#\r\n`);
+  // 16. R1 Restart Command
+  const r1Cmd = buildCantrackCommand(imeiO, 'R1', [], fixedTime);
+  assert.strictEqual(r1Cmd, `*HQ,${imeiO},R1,${fixedTime}#`);
 
-  const restartCmd = buildCantrackCommand(imeiO, 'R1', [], fixedTime);
-  assert.strictEqual(restartCmd, `*HQ,${imeiO},R1,${fixedTime}#\r\n`);
+  // 17. WKMD Working Mode
+  const wkmdCmd = buildCantrackCommand(imeiO, 'WKMD', [0], fixedTime);
+  assert.strictEqual(wkmdCmd, `*HQ,${imeiO},WKMD,${fixedTime},0#`);
 
-  const readStateCmd = buildCantrackCommand(imeiO, 'S26', [0], fixedTime);
-  assert.strictEqual(readStateCmd, `*HQ,${imeiO},S26,${fixedTime},0#\r\n`);
-
-  const centerNumCmd = buildCantrackCommand(imeiO, 'S2', ['08012345678'], fixedTime);
-  assert.strictEqual(centerNumCmd, `*HQ,${imeiO},S2,${fixedTime},08012345678#\r\n`);
-
-  const overspeedCmd = buildCantrackCommand(imeiO, 'S33', [80], fixedTime);
-  assert.strictEqual(overspeedCmd, `*HQ,${imeiO},S33,${fixedTime},80#\r\n`);
-
-  const geofenceCmd = buildCantrackCommand(imeiO, 'S21', [1000, 1], fixedTime);
-  assert.strictEqual(geofenceCmd, `*HQ,${imeiO},S21,${fixedTime},1000,1#\r\n`);
-
-  const alarmModeCmd = buildCantrackCommand(imeiO, 'S18', [1], fixedTime);
-  assert.strictEqual(alarmModeCmd, `*HQ,${imeiO},S18,${fixedTime},1#\r\n`);
-
-  // Test Secumore hashtag command builders
-  const secumoreStopOil = buildSecumoreCommand('stopoil', '123456');
-  assert.strictEqual(secumoreStopOil, '#stopoil#123456#\r\n');
-
-  const secumoreSupplyOil = buildSecumoreCommand('supplyoil', '123456');
-  assert.strictEqual(secumoreSupplyOil, '#supplyoil#123456#\r\n');
-
-  const secumoreInterval = buildSecumoreCommand('at', null, [30]);
-  assert.strictEqual(secumoreInterval, '#at#30#sum#0#\r\n');
-
-  const secumoreTracker = buildSecumoreCommand('tracker', '123456');
-  assert.strictEqual(secumoreTracker, '#tracker#123456#\r\n');
-
-  const secumoreRestart = buildSecumoreCommand('begin', '123456');
-  assert.strictEqual(secumoreRestart, '#begin#123456#\r\n');
-
-  const secumoreSpeed = buildSecumoreCommand('speed', '123456', [80]);
-  assert.strictEqual(secumoreSpeed, '#speed#123456#080#\r\n');
-
-  const secumoreNoSpeed = buildSecumoreCommand('nospeed', '123456');
-  assert.strictEqual(secumoreNoSpeed, '#nospeed#123456#\r\n');
-
-  // Test sanitizeCommandString handling double backslashes (\r\n as literal ASCII)
-  const doubleEscaped = '#supplyoil#123456#\\r\\n';
+  // Test sanitizeCommandString stripping any trailing CRLF
+  const doubleEscaped = '*HQ,867232054850970,S20,120000,1,1#\\r\\n';
   const cleanedDoubleEscaped = sanitizeCommandString(doubleEscaped);
-  assert.strictEqual(cleanedDoubleEscaped, '#supplyoil#123456#\r\n');
-  assert.strictEqual(Buffer.from(cleanedDoubleEscaped).toString('hex'), '23737570706c796f696c23313233343536230d0a');
+  assert.strictEqual(cleanedDoubleEscaped, '*HQ,867232054850970,S20,120000,1,1#');
   console.log('✅ Test O Passed!\n');
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -570,34 +588,26 @@ async function runTests() {
   assert.strictEqual(resP.success, true);
   assert.strictEqual(mockSockP.written.length, 1);
   assert(mockSockP.written[0].startsWith(`*HQ,${imeiO},WKMD,`));
-  assert(mockSockP.written[0].endsWith(',0#\r\n'));
+  assert(mockSockP.written[0].endsWith(',0#'));
 
-  // Test sendRawDeviceCommand: purely trims and writes directly to socket with no builder
-  const rawDirect = `HQ,${imeiO},S20,195440,1,1#`;
+  // Test sendRawDeviceCommand: purely trims and writes directly to socket ending in '#'
+  const rawDirect = `*HQ,${imeiO},S20,195440,1,1#`;
   const resRawDirect = await sendRawDeviceCommand(imeiO, rawDirect);
   assert.strictEqual(resRawDirect.success, true);
   assert.strictEqual(resRawDirect.cmd, 'RAW');
-  assert.strictEqual(resRawDirect.command, `HQ,${imeiO},S20,195440,1,1#`);
-  assert.strictEqual(mockSockP.written[1], `HQ,${imeiO},S20,195440,1,1#\r\n`);
+  assert.strictEqual(resRawDirect.command, `*HQ,${imeiO},S20,195440,1,1#`);
+  assert.strictEqual(mockSockP.written[1], `*HQ,${imeiO},S20,195440,1,1#`);
 
-  // Test Raw Command starting with '#' (e.g. #supplyoil#123456#)
-  const hashCmd = '#supplyoil#123456#\\r\\n';
-  const resHash = await sendRawDeviceCommand(imeiO, hashCmd);
-  assert.strictEqual(resHash.success, true);
-  assert.strictEqual(resHash.cmd, 'RAW');
-  assert.strictEqual(resHash.command, '#supplyoil#123456#');
-  assert.strictEqual(mockSockP.written[2], '#supplyoil#123456#\r\n');
-  assert.strictEqual(Buffer.from(mockSockP.written[2]).toString('hex'), '23737570706c796f696c23313233343536230d0a');
-
-  // Test Secumore command dispatch via sendDeviceCommand
-  const resSecumore = await sendDeviceCommand(imeiO, 'stopoil', ['123456']);
-  assert.strictEqual(resSecumore.success, true);
-  assert.strictEqual(mockSockP.written[3], '#stopoil#123456#\r\n');
+  // Test sendDeviceCommand with alias 'cut-fuel' -> builds Cantrack S20,1,1
+  const resCutFuel = await sendDeviceCommand(imeiO, 'cut-fuel');
+  assert.strictEqual(resCutFuel.success, true);
+  assert(mockSockP.written[2].startsWith(`*HQ,${imeiO},S20,`));
+  assert(mockSockP.written[2].endsWith(',1,1#'));
 
   // Check device state
   const deviceStateP = getDeviceState(imeiO);
   assert.strictEqual(deviceStateP.connected, true);
-  assert.strictEqual(deviceStateP.lastCommand.cmd, 'stopoil');
+  assert.strictEqual(deviceStateP.lastCommand.cmd, 'cut-fuel');
 
   // Check connected devices list
   const allDevices = getConnectedDevices();
@@ -608,6 +618,7 @@ async function runTests() {
   assert.strictEqual(emittedGpsEvents[0].imei, imeiO);
   assert.strictEqual(emittedGpsEvents[0].cmd, 'WKMD');
   assert.strictEqual(emittedGpsEvents[1].cmd, 'RAW');
+  assert.strictEqual(emittedGpsEvents[2].cmd, 'cut-fuel');
 
   gpsEventEmitter.off('gps:command_sent', eventHandlerP);
   console.log('✅ Test P Passed!\n');

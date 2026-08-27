@@ -601,6 +601,21 @@ async function getDevicesByUser(userId) {
 }
 
 /**
+ * Get all registered devices from the database.
+ */
+async function getAllDevices() {
+  if (pool && isConnected) {
+    try {
+      const [rows] = await pool.query('SELECT * FROM devices ORDER BY last_seen_at DESC, created_at DESC');
+      if (rows && rows.length > 0) return rows;
+    } catch (err) {
+      logger.error('MYSQL_GET_ALL_DEVICES_ERROR', { error: err.message });
+    }
+  }
+  return Array.from(memoryDevices.values());
+}
+
+/**
  * Permanently delete a device and purge all associated records (location history, command logs, metadata).
  */
 async function deleteDevice(imei) {
@@ -825,6 +840,7 @@ module.exports = {
   findUserByUsername,
   findUserById,
   registerNewDevice,
+  getAllDevices,
   getDeviceByImei,
   getDevicesByUser,
   updateDeviceInfo,
