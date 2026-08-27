@@ -177,6 +177,76 @@ const swaggerSpec = {
       },
     },
 
+    '/api/gps/auth/delete-account': {
+      post: {
+        tags: ['GPS Auth'],
+        summary: 'Delete User Account (2-Step Verification Flow)',
+        description:
+          'Permanently deletes a user account, all registered vehicles, GPS devices, and location history.\n\n' +
+          '**Step 1 (Request OTP):** Call with `verify: false` and `email`. A 6-digit verification code is dispatched to the user via SendGrid.\n\n' +
+          '**Step 2 (Confirm Deletion):** Call with `verify: true`, `email`, and the 6-digit `code`. The account and all associated devices are permanently purged.',
+        security: [],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['email'],
+                properties: {
+                  email: {
+                    type: 'string',
+                    format: 'email',
+                    example: 'driver_john@example.com',
+                    description: 'Registered user email address',
+                  },
+                  code: {
+                    type: 'string',
+                    example: '492815',
+                    description: '6-digit OTP verification code received via email (Required when verify is true)',
+                  },
+                  verify: {
+                    type: 'boolean',
+                    default: false,
+                    example: false,
+                    description: 'Set to false in Step 1 to request code, or true in Step 2 to confirm deletion',
+                  },
+                  reason: {
+                    type: 'string',
+                    example: 'No longer need vehicle tracking service',
+                    description: 'Optional feedback / reason for account deletion',
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: {
+            description: 'Step 1 OTP dispatched OR Step 2 Account successfully deleted',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: true },
+                    verify: { type: 'boolean', example: false },
+                    email: { type: 'string', example: 'driver_john@example.com' },
+                    message: { type: 'string', example: 'A 6-digit verification code has been sent to your email.' },
+                    expiresInMinutes: { type: 'number', example: 15 },
+                    deletedAt: { type: 'string', format: 'date-time', example: '2026-08-28T00:00:00.000Z' },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Invalid code, expired code, or missing required fields' },
+          404: { description: 'No registered user found with the provided email' },
+          500: { description: 'Internal server error during deletion' },
+        },
+      },
+    },
+
     // ── GPS Devices ───────────────────────────────────────────────────────────
     '/api/gps/devices': {
       get: {
