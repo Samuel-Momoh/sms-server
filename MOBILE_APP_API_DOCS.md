@@ -139,6 +139,70 @@ Retrieves the authenticated user's profile information.
 
 ---
 
+### 2.4 Delete User Account (2-Step Verification Flow)
+Permanently deletes a user's account along with all their registered GPS tracking devices, vehicles, and location history.
+
+- **Endpoint**: `POST /api/gps/auth/delete-account` (or `POST /api/gps/auth/account/delete`)
+- **Headers**: `Content-Type: application/json`
+
+#### Step 1: Request Deletion Verification Code
+Dispatches a 6-digit OTP code to the user's registered email via SendGrid.
+
+**Request Body (`verify: false`):**
+```json
+{
+  "email": "samuel@example.com",
+  "reason": "No longer need tracking service",
+  "verify": false
+}
+```
+
+**Success Response (`200 OK`):**
+```json
+{
+  "success": true,
+  "verify": false,
+  "email": "samuel@example.com",
+  "message": "A 6-digit verification code has been sent to your email. Please submit the code with verify: true to confirm permanent deletion.",
+  "expiresInMinutes": 15,
+  "emailDispatched": true
+}
+```
+
+---
+
+#### Step 2: Confirm Deletion with OTP Code
+Submits the 6-digit code received by email to permanently purge the account and devices.
+
+**Request Body (`verify: true`):**
+```json
+{
+  "email": "samuel@example.com",
+  "code": "492815",
+  "verify": true,
+  "reason": "No longer need tracking service"
+}
+```
+
+**Success Response (`200 OK`):**
+```json
+{
+  "success": true,
+  "verify": true,
+  "message": "Your account and all associated GPS devices and data have been permanently deleted.",
+  "email": "samuel@example.com",
+  "deletedAt": "2026-08-27T22:45:00.000Z"
+}
+```
+
+**Error Responses:**
+- `400 Bad Request`: `{ "success": false, "error": "Verification code (code) is required when verify is true" }`
+- `400 Bad Request`: `{ "success": false, "error": "Invalid verification code. Please check your email and try again." }`
+- `400 Bad Request`: `{ "success": false, "error": "Verification code has expired or was not requested. Please request a new code." }`
+- `404 Not Found`: `{ "success": false, "error": "No registered account found with this email address." }`
+
+---
+
 ## 3. Device Registration & Fleet Management APIs
 
 ### 3.1 Register / Add a Device to Account

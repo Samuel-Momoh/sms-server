@@ -395,6 +395,95 @@ async function findUserById(id) {
   return null;
 }
 
+/**
+ * Permanently delete a user account and all owned devices and records.
+ *
+ * @param {number|string} userIdOrEmail
+ * @returns {Promise<boolean>}
+ */
+async function deleteUser(userIdOrEmail) {
+  if (!userIdOrEmail) return false;
+
+  let user = null;
+  if (typeof userIdOrEmail === 'number' || /^\d+$/.test(String(userIdOrEmail))) {
+    user = await findUserById(userIdOrEmail);
+  }
+  if (!user) {
+    user = await findUserByEmailOrUsername(String(userIdOrEmail));
+  }
+
+  if (!user) {
+    logger.warn('DELETE_USER_NOT_FOUND', { identifier: userIdOrEmail });
+    return false;
+  }
+
+  const userId = user.id;
+  const userEmail = user.email ? user.email.toLowerCase() : '';
+  const username = user.username ? user.username.toLowerCase() : '';
+
+  // 1. Find and permanently purge all devices owned by this user
+  try {
+    const userDevices = await getDevicesByUser(userId);
+    for (const dev of userDevices) {
+      if (dev.imei) {
+        await deleteDevice(dev.imei);
+      }
+    }
+  } catch (err) {
+    logger.error('DELETE_USER_DEVICES_ERROR', { userId, error: err.message });
+  }
+
+  // 2. Delete user from MySQL
+  if (pool && isConnected) {
+    try {
+      await pool.query('DELETE FROM users WHERE id = ?', [userId]);
+    } catch (err) {
+      logger.error('MYSQL_DELETE_USER_ERROR', { userId, error: err.message });
+      throw err;
+    }
+  }
+
+  // 3. Delete from in-memory user map
+  if (userEmail) memoryUsers.delete(userEmail);
+  if (username) memoryUsers.delete(username);
+
+  logger.info('USER_ACCOUNT_PURGED', {
+    userId,
+    email: userEmail,
+    username,
+  });
+
+  return true;
+}
+
+// ── In-Memory Deletion OTP Store ──────────────────────────────────────────────
+const deletionOtpStore = new Map();
+
+function saveDeletionOtp(email, { code, reason, expiresAt }) {
+  const cleanEmail = email.trim().toLowerCase();
+  deletionOtpStore.set(cleanEmail, {
+    code: String(code).trim(),
+    reason: reason || '',
+    expiresAt: expiresAt || Date.now() + 15 * 60 * 1000,
+  });
+}
+
+function getDeletionOtp(email) {
+  const cleanEmail = email.trim().toLowerCase();
+  const entry = deletionOtpStore.get(cleanEmail);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    deletionOtpStore.delete(cleanEmail);
+    return null;
+  }
+  return entry;
+}
+
+function removeDeletionOtp(email) {
+  const cleanEmail = email.trim().toLowerCase();
+  deletionOtpStore.delete(cleanEmail);
+}
+
 // ── Device Management Methods ─────────────────────────────────────────────────
 
 async function ensureDeviceColumns() {
@@ -839,6 +928,10 @@ module.exports = {
   findUserByEmailOrUsername,
   findUserByUsername,
   findUserById,
+  deleteUser,
+  saveDeletionOtp,
+  getDeletionOtp,
+  removeDeletionOtp,
   registerNewDevice,
   getAllDevices,
   getDeviceByImei,

@@ -26,6 +26,10 @@ const {
   findUserByEmailOrUsername,
   findUserByUsername,
   findUserById,
+  deleteUser,
+  saveDeletionOtp,
+  getDeletionOtp,
+  removeDeletionOtp,
   registerNewDevice,
   getAllDevices,
   getDeviceByImei,
@@ -37,6 +41,7 @@ const {
   upsertDevice,
   saveLocationHistory,
 } = require('./db/mysql');
+const { sendAccountDeletionOtp } = require('./services/emailService');
 const { gpsEventEmitter } = require('./gpsEvents');
 const {
   adminAuth,
@@ -287,6 +292,157 @@ router.post('/auth/login', async (req, res) => {
   logger.warn('LOGIN_FAILED', { user, ip: req.socket.remoteAddress });
   return res.status(401).json({ success: false, error: 'Invalid username or password' });
 });
+
+// ── 3. POST /api/gps/auth/delete-account (2-Step Account Deletion Flow) ───────
+/**
+ * Two-Step Account Deletion Flow:
+ *
+ * Step 1: Request Deletion Code
+ *   Body: { "email": "user@example.com", "reason": "No longer needed", "verify": false }
+ *   Action: Validates user existence, generates 6-digit OTP code, stores code for 15 mins,
+ *           and dispatches verification code email via SendGrid (SEND_API_KEY).
+ *
+ * Step 2: Confirm Deletion with Code
+ *   Body: { "email": "user@example.com", "code": "123456", "verify": true, "reason": "..." }
+ *   Action: Validates OTP code against email, permanently purges user account and all
+ *           registered GPS trackers and location history.
+ */
+async function handleAccountDeletion(req, res) {
+  const {
+    email,
+    username,
+    reason = '',
+    code = '',
+    verify = false,
+  } = req.body || {};
+
+  const targetEmail = (email || username || req.user?.email || '').trim().toLowerCase();
+
+  if (!targetEmail) {
+    return res.status(400).json({
+      success: false,
+      error: 'email is required for account deletion',
+    });
+  }
+
+  // Validate email format
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(targetEmail)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Please provide a valid email address',
+    });
+  }
+
+  const isVerifyStep = verify === true || verify === 'true' || Boolean(code && String(code).trim());
+
+  // ── STEP 2: Verify OTP & Permanently Delete Account ──────────────────────────
+  if (isVerifyStep) {
+    const cleanCode = String(code).trim();
+    if (!cleanCode) {
+      return res.status(400).json({
+        success: false,
+        error: 'Verification code (code) is required when verify is true',
+      });
+    }
+
+    const stored = getDeletionOtp(targetEmail);
+    if (!stored) {
+      return res.status(400).json({
+        success: false,
+        error: 'Verification code has expired or was not requested. Please request a new code.',
+      });
+    }
+
+    if (String(stored.code).trim() !== cleanCode) {
+      logger.warn('ACCOUNT_DELETION_INVALID_CODE', {
+        email: targetEmail,
+        attemptedCode: cleanCode,
+        ip: req.socket.remoteAddress,
+      });
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid verification code. Please check your email and try again.',
+      });
+    }
+
+    // Verify user exists in database
+    const user = await findUserByEmailOrUsername(targetEmail);
+    if (!user) {
+      removeDeletionOtp(targetEmail);
+      return res.status(404).json({
+        success: false,
+        error: 'No registered account found with this email address.',
+      });
+    }
+
+    try {
+      // Permanently purge user account and all owned devices
+      await deleteUser(user.id || targetEmail);
+      removeDeletionOtp(targetEmail);
+
+      logger.info('ACCOUNT_DELETION_CONFIRMED', {
+        email: targetEmail,
+        userId: user.id,
+        reason: reason || stored.reason || 'None provided',
+        ip: req.socket.remoteAddress,
+      });
+
+      return res.json({
+        success: true,
+        verify: true,
+        message: 'Your account and all associated GPS devices and data have been permanently deleted.',
+        email: targetEmail,
+        deletedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      logger.error('ACCOUNT_DELETION_FAILED', { email: targetEmail, error: err.message });
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to complete account deletion: ' + err.message,
+      });
+    }
+  }
+
+  // ── STEP 1: Generate & Dispatch 6-Digit OTP via SendGrid ─────────────────────
+  const user = await findUserByEmailOrUsername(targetEmail);
+  if (!user) {
+    return res.status(404).json({
+      success: false,
+      error: `No registered account found with email '${targetEmail}'.`,
+    });
+  }
+
+  // Generate secure 6-digit random code
+  const generatedCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+  // Store in memory OTP map with 15-minute expiration
+  saveDeletionOtp(targetEmail, {
+    code: generatedCode,
+    reason: reason ? String(reason).trim() : '',
+    expiresAt: Date.now() + 15 * 60 * 1000,
+  });
+
+  logger.info('ACCOUNT_DELETION_OTP_GENERATED', {
+    email: targetEmail,
+    ip: req.socket.remoteAddress,
+  });
+
+  // Dispatch email via SendGrid
+  const emailSent = await sendAccountDeletionOtp(targetEmail, generatedCode, reason);
+
+  return res.json({
+    success: true,
+    verify: false,
+    email: targetEmail,
+    message: 'A 6-digit verification code has been sent to your email. Please submit the code with verify: true to confirm permanent deletion.',
+    expiresInMinutes: 15,
+    emailDispatched: emailSent,
+  });
+}
+
+router.post('/auth/delete-account', handleAccountDeletion);
+router.post('/auth/account/delete', handleAccountDeletion);
 
 // ── Apply Authentication to All Protected Endpoints ──────────────────────────
 router.use(adminAuth);
