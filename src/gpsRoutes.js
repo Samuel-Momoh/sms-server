@@ -1051,6 +1051,7 @@ router.post('/devices/:imei/interval', requireDeviceAccess, async (req, res) => 
   const { imei } = req.params;
   const { intervalSeconds = 30, interval = 30 } = req.body || {};
   const secs = parseInt(intervalSeconds || interval, 10) || 30;
+  updateDeviceState(imei, { trackingInterval: secs });
   return dispatchOrQueue(imei, 'D1', [secs], req, res);
 });
 

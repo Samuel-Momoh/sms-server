@@ -601,14 +601,19 @@ function enforceContinuousTracking(socket, imei) {
     });
   });
 
-  // Step 2: Set GPRS reporting interval to 30 seconds (*HQ,IMEI,D1,HHMMSS,30#)
+  // Step 2: Set GPRS reporting interval (*HQ,IMEI,D1,HHMMSS,interval#)
+  const targetInterval = trackerState.trackingInterval ||
+    deviceStates.get(imei)?.trackingInterval ||
+    parseInt(process.env.TRACKING_INTERVAL || process.env.DEFAULT_TRACKING_INTERVAL, 10) ||
+    30;
+
   setTimeout(() => {
     if (socket && !socket.destroyed) {
-      const d1Cmd = buildCantrackCommand(imei, 'D1', [30]);
+      const d1Cmd = buildCantrackCommand(imei, 'D1', [targetInterval]);
       socket.write(d1Cmd, () => {
         logger.info('HQ_AUTO_ENFORCE_INTERVAL', {
           imei,
-          intervalSeconds: 30,
+          intervalSeconds: targetInterval,
           command: d1Cmd.trim(),
         });
       });
