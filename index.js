@@ -141,7 +141,7 @@ const swaggerSpec = {
       post: {
         tags: ['GPS Auth'],
         summary: 'User & Admin Login',
-        description: 'Authenticates user with email and password and returns a signed JWT token.',
+        description: 'Authenticates user with email and password. Optional `rememberMe` keeps user logged in forever (10 years).',
         security: [],
         requestBody: {
           required: true,
@@ -153,14 +153,73 @@ const swaggerSpec = {
                 properties: {
                   email: { type: 'string', example: 'driver_john@example.com' },
                   password: { type: 'string', example: 'securePassword123' },
+                  rememberMe: { type: 'boolean', default: false, example: true, description: 'Keep user logged in forever (10 years / 3650d)' },
                 },
               },
             },
           },
         },
         responses: {
-          200: { description: 'Authenticated successfully' },
+          200: { description: 'Authenticated successfully with JWT Bearer token' },
           401: { description: 'Invalid credentials' },
+        },
+      },
+    },
+
+    '/api/gps/auth/forgot-password': {
+      post: {
+        tags: ['GPS Auth'],
+        summary: 'Forgot Password (Request 6-Digit OTP)',
+        description: 'Dispatches a 6-digit verification code to the registered email address via SendGrid (valid for 15 minutes).',
+        security: [],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['email'],
+                properties: {
+                  email: { type: 'string', format: 'email', example: 'driver_john@example.com' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Verification code dispatched to email' },
+          400: { description: 'Invalid email' },
+          404: { description: 'No account registered with this email' },
+        },
+      },
+    },
+
+    '/api/gps/auth/reset-password': {
+      post: {
+        tags: ['GPS Auth'],
+        summary: 'Reset Password (Verify OTP & Set New Password)',
+        description: 'Validates the 6-digit verification code sent by email and updates the account password.',
+        security: [],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['email', 'code', 'newPassword'],
+                properties: {
+                  email: { type: 'string', format: 'email', example: 'driver_john@example.com' },
+                  code: { type: 'string', example: '492815', description: '6-digit OTP verification code' },
+                  newPassword: { type: 'string', example: 'newSecurePassword456', description: 'New password (min 6 characters)' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Password reset successfully and returns new JWT login token' },
+          400: { description: 'Invalid or expired OTP code, or password too short' },
+          404: { description: 'No registered user found' },
         },
       },
     },

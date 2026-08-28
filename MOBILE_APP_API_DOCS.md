@@ -74,6 +74,7 @@ Creates a new mobile app user account with `email` and `password` and immediatel
 
 ### 2.2 User & Admin Login
 Authenticates a user using `email` (or `username`) and `password`, returning a signed JWT token for subsequent API and WebSocket calls.
+Supports optional `rememberMe: true` to keep the user logged in forever (10 years / 3650d).
 
 - **Endpoint**: `POST /api/gps/auth/login`
 - **Auth Required**: No (Public)
@@ -83,7 +84,8 @@ Authenticates a user using `email` (or `username`) and `password`, returning a s
 ```json
 {
   "email": "samuel@example.com",
-  "password": "SecurePassword123!"
+  "password": "SecurePassword123!",
+  "rememberMe": true
 }
 ```
 
@@ -97,7 +99,8 @@ Authenticates a user using `email` (or `username`) and `password`, returning a s
     "type": "Bearer",
     "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
     "header": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "expiresIn": "24h"
+    "expiresIn": "3650d",
+    "rememberMe": true
   },
   "user": {
     "id": 2,
@@ -116,7 +119,84 @@ Authenticates a user using `email` (or `username`) and `password`, returning a s
 
 ---
 
-### 2.3 Get Current User Profile
+### 2.3 Password Recovery (Forgot & Reset Password Flow)
+
+#### Step 1: Request 6-Digit Password Reset OTP
+Sends a 6-digit verification code to the registered email address via SendGrid (valid for 15 minutes).
+
+- **Endpoint**: `POST /api/gps/auth/forgot-password` (or `POST /api/gps/auth/reset-password` with `email` only)
+- **Headers**: `Content-Type: application/json`
+
+**Request Body:**
+```json
+{
+  "email": "samuel@example.com"
+}
+```
+
+**Success Response (`200 OK`):**
+```json
+{
+  "success": true,
+  "verify": false,
+  "email": "samuel@example.com",
+  "message": "A 6-digit verification code has been sent to your email. Please submit the code with your new password to reset your account.",
+  "expiresInMinutes": 15,
+  "emailDispatched": true
+}
+```
+
+---
+
+#### Step 2: Confirm OTP & Set New Password
+Validates the verification code and updates the account password in the database, automatically returning an active JWT token.
+
+- **Endpoint**: `POST /api/gps/auth/reset-password`
+- **Headers**: `Content-Type: application/json`
+
+**Request Body:**
+```json
+{
+  "email": "samuel@example.com",
+  "code": "492815",
+  "newPassword": "NewSecurePassword456!"
+}
+```
+
+**Success Response (`200 OK`):**
+```json
+{
+  "success": true,
+  "verify": true,
+  "message": "Password has been reset successfully. You are now logged in.",
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "auth": {
+    "type": "Bearer",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "header": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "expiresIn": "24h"
+  },
+  "user": {
+    "id": 2,
+    "email": "samuel@example.com",
+    "username": "samuel",
+    "name": "Samuel Momoh",
+    "phone": "+2348012345678",
+    "role": "user"
+  }
+}
+```
+
+**Error Responses:**
+- `400 Bad Request`: `{ "success": false, "error": "6-digit verification code (code) is required" }`
+- `400 Bad Request`: `{ "success": false, "error": "newPassword is required and must be at least 6 characters long" }`
+- `400 Bad Request`: `{ "success": false, "error": "Invalid verification code. Please check your email and try again." }`
+- `400 Bad Request`: `{ "success": false, "error": "Verification code has expired or was not requested. Please request a new code." }`
+- `404 Not Found`: `{ "success": false, "error": "No registered account found with this email address." }`
+
+---
+
+### 2.4 Get Current User Profile
 Retrieves the authenticated user's profile information.
 
 - **Endpoint**: `GET /api/gps/auth/me`

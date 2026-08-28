@@ -484,6 +484,85 @@ function removeDeletionOtp(email) {
   deletionOtpStore.delete(cleanEmail);
 }
 
+/**
+ * Update a user's password.
+ *
+ * @param {number|string} userIdOrEmail
+ * @param {string} newPassword
+ * @returns {Promise<boolean>}
+ */
+async function updateUserPassword(userIdOrEmail, newPassword) {
+  if (!userIdOrEmail || !newPassword) return false;
+
+  let user = null;
+  if (typeof userIdOrEmail === 'number' || /^\d+$/.test(String(userIdOrEmail))) {
+    user = await findUserById(userIdOrEmail);
+  }
+  if (!user) {
+    user = await findUserByEmailOrUsername(String(userIdOrEmail));
+  }
+
+  if (!user) {
+    logger.warn('UPDATE_PASSWORD_USER_NOT_FOUND', { identifier: userIdOrEmail });
+    return false;
+  }
+
+  const newHash = hashPassword(newPassword);
+
+  if (pool && isConnected) {
+    try {
+      await pool.query('UPDATE users SET password_hash = ? WHERE id = ?', [newHash, user.id]);
+    } catch (err) {
+      logger.error('MYSQL_UPDATE_PASSWORD_ERROR', { userId: user.id, error: err.message });
+      throw err;
+    }
+  }
+
+  // Update in-memory user
+  const emailKey = user.email ? user.email.toLowerCase() : '';
+  const userKey = user.username ? user.username.toLowerCase() : '';
+  if (emailKey && memoryUsers.has(emailKey)) {
+    memoryUsers.get(emailKey).password_hash = newHash;
+  }
+  if (userKey && memoryUsers.has(userKey)) {
+    memoryUsers.get(userKey).password_hash = newHash;
+  }
+
+  logger.info('USER_PASSWORD_UPDATED', {
+    userId: user.id,
+    email: user.email,
+  });
+
+  return true;
+}
+
+// ── In-Memory Password Reset OTP Store ────────────────────────────────────────
+const passwordResetOtpStore = new Map();
+
+function savePasswordResetOtp(email, { code, expiresAt }) {
+  const cleanEmail = email.trim().toLowerCase();
+  passwordResetOtpStore.set(cleanEmail, {
+    code: String(code).trim(),
+    expiresAt: expiresAt || Date.now() + 15 * 60 * 1000,
+  });
+}
+
+function getPasswordResetOtp(email) {
+  const cleanEmail = email.trim().toLowerCase();
+  const entry = passwordResetOtpStore.get(cleanEmail);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    passwordResetOtpStore.delete(cleanEmail);
+    return null;
+  }
+  return entry;
+}
+
+function removePasswordResetOtp(email) {
+  const cleanEmail = email.trim().toLowerCase();
+  passwordResetOtpStore.delete(cleanEmail);
+}
+
 // ── Device Management Methods ─────────────────────────────────────────────────
 
 async function ensureDeviceColumns() {
@@ -929,9 +1008,13 @@ module.exports = {
   findUserByUsername,
   findUserById,
   deleteUser,
+  updateUserPassword,
   saveDeletionOtp,
   getDeletionOtp,
   removeDeletionOtp,
+  savePasswordResetOtp,
+  getPasswordResetOtp,
+  removePasswordResetOtp,
   registerNewDevice,
   getAllDevices,
   getDeviceByImei,

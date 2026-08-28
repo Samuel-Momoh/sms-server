@@ -27,9 +27,13 @@ const {
   findUserByUsername,
   findUserById,
   deleteUser,
+  updateUserPassword,
   saveDeletionOtp,
   getDeletionOtp,
   removeDeletionOtp,
+  savePasswordResetOtp,
+  getPasswordResetOtp,
+  removePasswordResetOtp,
   registerNewDevice,
   getAllDevices,
   getDeviceByImei,
@@ -41,7 +45,7 @@ const {
   upsertDevice,
   saveLocationHistory,
 } = require('./db/mysql');
-const { sendAccountDeletionOtp } = require('./services/emailService');
+const { sendAccountDeletionOtp, sendPasswordResetOtp } = require('./services/emailService');
 const { gpsEventEmitter } = require('./gpsEvents');
 const {
   adminAuth,
@@ -207,6 +211,12 @@ router.post('/auth/login', async (req, res) => {
 
   let user = req.body?.email || req.body?.username || req.body?.adminUser || req.body?.admin_user;
   let pwd  = req.body?.password || req.body?.adminPwd  || req.body?.admin_pwd;
+  const isRememberMe = Boolean(
+    req.body?.rememberMe === true ||
+    req.body?.remember_me === true ||
+    req.body?.rememberMe === 'true' ||
+    req.body?.remember_me === 'true'
+  );
 
   const authHeader = req.headers['authorization'];
   if ((!user || !pwd) && authHeader && authHeader.startsWith('Basic ')) {
@@ -240,8 +250,14 @@ router.post('/auth/login', async (req, res) => {
       username: dbUser.username,
       name: dbUser.name,
       role: dbUser.role || 'user',
+      rememberMe: isRememberMe,
     });
-    logger.info('USER_LOGIN_SUCCESS', { user: dbUser.email || dbUser.username, role: dbUser.role, ip: req.socket.remoteAddress });
+    logger.info('USER_LOGIN_SUCCESS', {
+      user: dbUser.email || dbUser.username,
+      role: dbUser.role,
+      rememberMe: isRememberMe,
+      ip: req.socket.remoteAddress,
+    });
 
     return res.json({
       success: true,
@@ -251,7 +267,8 @@ router.post('/auth/login', async (req, res) => {
         type: 'Bearer',
         token: jwtToken,
         header: `Bearer ${jwtToken}`,
-        expiresIn: '24h',
+        expiresIn: isRememberMe ? '3650d' : '24h',
+        rememberMe: isRememberMe,
       },
       user: {
         id: dbUser.id,
@@ -266,9 +283,18 @@ router.post('/auth/login', async (req, res) => {
 
   // 2. Fallback: Check environment admin credentials
   if (cleanIdentifier === adminUser && pwd === adminPwd) {
-    const jwtToken = generateToken({ username: cleanIdentifier, email: cleanIdentifier, role: 'admin' });
+    const jwtToken = generateToken({
+      username: cleanIdentifier,
+      email: cleanIdentifier,
+      role: 'admin',
+      rememberMe: isRememberMe,
+    });
     const basicToken = Buffer.from(`${cleanIdentifier}:${pwd}`).toString('base64');
-    logger.info('ADMIN_LOGIN_SUCCESS', { user: cleanIdentifier, ip: req.socket.remoteAddress });
+    logger.info('ADMIN_LOGIN_SUCCESS', {
+      user: cleanIdentifier,
+      rememberMe: isRememberMe,
+      ip: req.socket.remoteAddress,
+    });
 
     return res.json({
       success: true,
@@ -278,7 +304,8 @@ router.post('/auth/login', async (req, res) => {
         type: 'Bearer',
         token: jwtToken,
         header: `Bearer ${jwtToken}`,
-        expiresIn: '24h',
+        expiresIn: isRememberMe ? '3650d' : '24h',
+        rememberMe: isRememberMe,
         basicToken,
       },
       user: {
@@ -292,6 +319,193 @@ router.post('/auth/login', async (req, res) => {
   logger.warn('LOGIN_FAILED', { user, ip: req.socket.remoteAddress });
   return res.status(401).json({ success: false, error: 'Invalid username or password' });
 });
+
+// ── 3. POST /api/gps/auth/forgot-password & /api/gps/auth/reset-password ───────
+/**
+ * Two-Step Password Recovery Flow:
+ *
+ * Step 1: Request Reset Code (POST /forgot-password or POST /reset-password with verify: false)
+ *   Body: { "email": "user@example.com" }
+ *   Action: Generates 6-digit OTP code, stores for 15 mins, and sends email via SendGrid.
+ *
+ * Step 2: Set New Password (POST /reset-password with code & newPassword)
+ *   Body: { "email": "user@example.com", "code": "123456", "newPassword": "newSecretPassword123" }
+ *   Action: Validates OTP, updates password in database, and returns fresh JWT token.
+ */
+async function handleForgotPassword(req, res) {
+  const { email, username } = req.body || {};
+  const targetEmail = (email || username || '').trim().toLowerCase();
+
+  if (!targetEmail) {
+    return res.status(400).json({
+      success: false,
+      error: 'email is required to request a password reset code',
+    });
+  }
+
+  // Validate email format
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(targetEmail)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Please provide a valid email address',
+    });
+  }
+
+  const user = await findUserByEmailOrUsername(targetEmail);
+  if (!user) {
+    return res.status(404).json({
+      success: false,
+      error: `No registered account found with email '${targetEmail}'.`,
+    });
+  }
+
+  // Generate secure 6-digit random code
+  const generatedCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+  // Save OTP in memory with 15-minute expiration
+  savePasswordResetOtp(targetEmail, {
+    code: generatedCode,
+    expiresAt: Date.now() + 15 * 60 * 1000,
+  });
+
+  logger.info('PASSWORD_RESET_OTP_GENERATED', {
+    email: targetEmail,
+    ip: req.socket.remoteAddress,
+  });
+
+  // Dispatch email via SendGrid
+  const emailSent = await sendPasswordResetOtp(targetEmail, generatedCode);
+
+  return res.json({
+    success: true,
+    verify: false,
+    email: targetEmail,
+    message: 'A 6-digit verification code has been sent to your email. Please submit the code with your new password to reset your account.',
+    expiresInMinutes: 15,
+    emailDispatched: emailSent,
+  });
+}
+
+async function handleResetPassword(req, res) {
+  const {
+    email,
+    username,
+    code = '',
+    newPassword = '',
+    password = '',
+    verify = false,
+  } = req.body || {};
+
+  const targetEmail = (email || username || '').trim().toLowerCase();
+  const cleanPassword = (newPassword || password || '').trim();
+  const cleanCode = String(code || '').trim();
+
+  // If called without code or newPassword, treat as Step 1 request
+  if (!cleanCode && !cleanPassword && (!verify || verify === 'false')) {
+    return handleForgotPassword(req, res);
+  }
+
+  if (!targetEmail) {
+    return res.status(400).json({
+      success: false,
+      error: 'email is required',
+    });
+  }
+
+  if (!cleanCode) {
+    return res.status(400).json({
+      success: false,
+      error: '6-digit verification code (code) is required',
+    });
+  }
+
+  if (!cleanPassword || cleanPassword.length < 6) {
+    return res.status(400).json({
+      success: false,
+      error: 'newPassword is required and must be at least 6 characters long',
+    });
+  }
+
+  const stored = getPasswordResetOtp(targetEmail);
+  if (!stored) {
+    return res.status(400).json({
+      success: false,
+      error: 'Verification code has expired or was not requested. Please request a new code.',
+    });
+  }
+
+  if (String(stored.code).trim() !== cleanCode) {
+    logger.warn('PASSWORD_RESET_INVALID_CODE', {
+      email: targetEmail,
+      attemptedCode: cleanCode,
+      ip: req.socket.remoteAddress,
+    });
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid verification code. Please check your email and try again.',
+    });
+  }
+
+  const user = await findUserByEmailOrUsername(targetEmail);
+  if (!user) {
+    removePasswordResetOtp(targetEmail);
+    return res.status(404).json({
+      success: false,
+      error: 'No registered account found with this email address.',
+    });
+  }
+
+  try {
+    // Update password in database and memory
+    await updateUserPassword(user.id || targetEmail, cleanPassword);
+    removePasswordResetOtp(targetEmail);
+
+    logger.info('PASSWORD_RESET_SUCCESS', {
+      email: targetEmail,
+      userId: user.id,
+      ip: req.socket.remoteAddress,
+    });
+
+    const jwtToken = generateToken({
+      id: user.id,
+      email: user.email,
+      username: user.username,
+      name: user.name,
+      role: user.role || 'user',
+    });
+
+    return res.json({
+      success: true,
+      verify: true,
+      message: 'Password has been reset successfully. You are now logged in.',
+      token: jwtToken,
+      auth: {
+        type: 'Bearer',
+        token: jwtToken,
+        header: `Bearer ${jwtToken}`,
+        expiresIn: '24h',
+      },
+      user: {
+        id: user.id,
+        email: user.email,
+        username: user.username,
+        name: user.name,
+        phone: user.phone,
+        role: user.role || 'user',
+      },
+    });
+  } catch (err) {
+    logger.error('PASSWORD_RESET_FAILED', { email: targetEmail, error: err.message });
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to reset password: ' + err.message,
+    });
+  }
+}
+
+router.post('/auth/forgot-password', handleForgotPassword);
+router.post('/auth/reset-password', handleResetPassword);
 
 // ── 3. POST /api/gps/auth/delete-account (2-Step Account Deletion Flow) ───────
 /**

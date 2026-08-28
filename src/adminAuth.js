@@ -43,9 +43,12 @@ function verifyPassword(password, storedHash) {
 
 /**
  * Generate a signed JWT token for the authenticated user.
+ * Supports optional rememberMe to keep user logged in forever (10 years / 3650d).
  */
-function generateToken(payload = {}) {
+function generateToken(payload = {}, options = {}) {
   const adminUser = process.env.ADMIN_USER || process.env.GATEWAY_USERNAME || 'admin';
+  const isForever = payload.rememberMe === true || payload.remember_me === true || options.rememberMe === true;
+  const expiresIn = options.expiresIn || (isForever ? '3650d' : JWT_EXPIRES_IN);
   return jwt.sign(
     {
       sub: payload.id || payload.username || adminUser,
@@ -56,7 +59,7 @@ function generateToken(payload = {}) {
       ...payload,
     },
     JWT_SECRET,
-    { expiresIn: JWT_EXPIRES_IN }
+    { expiresIn }
   );
 }
 

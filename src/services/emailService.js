@@ -139,7 +139,66 @@ async function sendAccountDeletionOtp(email, code, reason = '') {
   return sendEmail({ to: email, subject, text, html });
 }
 
+/**
+ * Generate and send a Password Reset Verification Code email.
+ *
+ * @param {string} email - User's email
+ * @param {string} code - 6-digit OTP code
+ * @returns {Promise<boolean>}
+ */
+async function sendPasswordResetOtp(email, code) {
+  const subject = 'Password Reset Verification Code';
+  const text = `Your verification code to reset your GPS Tracking password is: ${code}\n\nThis code will expire in 15 minutes. If you did not request a password reset, please ignore this email.`;
+
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Password Reset Verification</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #0f172a; margin: 0; padding: 20px; color: #f8fafc; }
+        .card { max-width: 500px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 32px; border: 1px solid #334155; }
+        .header { text-align: center; margin-bottom: 24px; }
+        .badge { display: inline-block; background: #3b82f6; color: #ffffff; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+        .title { font-size: 20px; font-weight: 700; color: #ffffff; margin-top: 12px; margin-bottom: 8px; }
+        .code-box { background: #0f172a; border: 2px dashed #3b82f6; border-radius: 8px; text-align: center; padding: 18px; margin: 24px 0; }
+        .code { font-size: 32px; font-weight: 800; letter-spacing: 6px; color: #60a5fa; font-family: monospace; }
+        .info { font-size: 13px; color: #94a3b8; line-height: 1.5; margin-bottom: 16px; }
+        .footer { font-size: 11px; color: #64748b; text-align: center; border-top: 1px solid #334155; padding-top: 16px; margin-top: 24px; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="header">
+          <span class="badge">Password Reset</span>
+          <h2 class="title">Reset Your Password</h2>
+          <p style="color: #94a3b8; font-size: 14px; margin: 0;">Use the verification code below to reset your password.</p>
+        </div>
+
+        <div class="code-box">
+          <div style="font-size: 12px; color: #94a3b8; text-transform: uppercase; margin-bottom: 6px;">Your Verification Code</div>
+          <div class="code">${code}</div>
+          <div style="font-size: 11px; color: #64748b; margin-top: 6px;">Valid for 15 minutes</div>
+        </div>
+
+        <div class="info">
+          Enter this verification code in your mobile application or web portal along with your new password to complete the reset process.
+        </div>
+
+        <div class="footer">
+          If you did not request a password reset, you can safely ignore this email. Your password will remain unchanged.
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  return sendEmail({ to: email, subject, text, html });
+}
+
 module.exports = {
   sendEmail,
   sendAccountDeletionOtp,
+  sendPasswordResetOtp,
 };
