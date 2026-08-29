@@ -777,14 +777,111 @@ socket.on('gps:command_dispatched', (data) => {
 
 ---
 
-## 8. Mobile App Testing: GPS Simulation Endpoint
+## 8. Mobile App Real-Time Testing & Route Simulator
 
-To test the mobile app interface without driving a physical car, use the simulation endpoint:
+### 8.1 Continuous Route Simulator from Coordinate Array (Live In-Memory Streaming)
+Streams an array of rich telemetry objects or latitude/longitude coordinates sequentially to the mobile app over the WebSocket `gps:update` event, simulating live driving motion.
+**Database remains 100% untouched** (no fake records saved in MySQL).
 
-- **Endpoint**: `POST /api/gps/simulate`
-- **Auth Required**: Yes (`Bearer <TOKEN>`)
+- **Endpoint**: `POST /api/gps/devices/simulate-trip` (or `POST /api/gps/devices/:imei/simulate-trip`)
+- **Headers**: `Content-Type: application/json`
+
+#### Request Body (Full-Fidelity Telemetry Log Objects):
+```json
+{
+  "imei": "867232054850970",
+  "intervalMs": 2000,
+  "coordinates": [
+    {
+      "id": "1787599508144_zqka7u",
+      "ts": "2026-08-24T19:25:08.144Z",
+      "level": "INFO",
+      "event": "HQ_GPS_UPDATE",
+      "protocol": "HQ",
+      "cmd": "V1",
+      "imei": "867232054850970",
+      "remote": "197.210.54.228:11610",
+      "latitude": 4.898115,
+      "longitude": 6.907373,
+      "speed": 35,
+      "speed_knots": 18.9,
+      "speed_kmh": 35,
+      "direction": 160,
+      "gpsStatus": "A",
+      "accOn": true,
+      "isBackupBattery": false,
+      "isOilCut": false,
+      "equStatusHex": "FFFFFBFF",
+      "timestamp": "2026-08-24 19:25:06 UTC"
+    },
+    {
+      "latitude": 4.898600,
+      "longitude": 6.907800,
+      "speed": 40,
+      "speed_kmh": 40,
+      "direction": 165,
+      "gpsStatus": "A",
+      "accOn": true,
+      "equStatusHex": "FFFFFBFF"
+    }
+  ]
+}
+```
+
+> **Note**: You can also pass a simple array of `[lat, lon]` pairs or pass the JSON array directly in the request body `[ {...}, {...} ]`. If `imei` is inside the first element, the endpoint detects it automatically!
+
+#### Parameters:
+- `imei` *(string, required)*: Device IMEI to simulate.
+- `coordinates` *(array, required)*: Array of `[lat, lon]` pairs or `[{latitude, longitude, speed?, direction?}]` objects.
+- `intervalMs` *(number, optional)*: Milliseconds between each step (default: `2000ms` / 2s).
+- `speed` *(number, optional)*: Default vehicle speed in km/h (default: `40`).
+- `accOn` *(boolean, optional)*: Ignition status (default: `true` = driving).
+- `loop` *(boolean, optional)*: If `true`, repeats the route indefinitely.
+
+#### Success Response (`200 OK`):
+```json
+{
+  "success": true,
+  "message": "Trip simulation started for device 867232054850970. Coordinates are streaming live to 'gps:update' every 2000ms. Database remains completely untouched.",
+  "imei": "867232054850970",
+  "totalPoints": 5,
+  "intervalMs": 2000,
+  "loop": false,
+  "firstPoint": { "latitude": 4.888308, "longitude": 6.913855, "speed_kmh": 45, "direction": 42, "accOn": true },
+  "lastPoint": { "latitude": 4.890500, "longitude": 6.915900, "speed_kmh": 55, "direction": 120, "accOn": true }
+}
+```
+
+---
+
+### 8.2 Stop Active Route Simulation
+
+- **Endpoint**: `POST /api/gps/devices/simulate-trip/stop` (or `POST /api/gps/devices/:imei/simulate-trip/stop`)
+- **Headers**: `Content-Type: application/json`
 
 #### Request Body:
+```json
+{
+  "imei": "867232054850970"
+}
+```
+
+#### Success Response (`200 OK`):
+```json
+{
+  "success": true,
+  "message": "Trip simulation stopped for device 867232054850970.",
+  "imei": "867232054850970",
+  "wasRunning": true
+}
+```
+
+---
+
+### 8.3 Single Batch Telemetry Simulator
+
+- **Endpoint**: `POST /api/gps/simulate`
+- **Request Body**:
 ```json
 {
   "imei": "867232054850970",
@@ -797,4 +894,3 @@ To test the mobile app interface without driving a physical car, use the simulat
   "steps": 1
 }
 ```
-*Note: This endpoint is strictly an **in-memory testing broadcast**. It emits real-time WebSocket `gps:update` events and updates live socket state without altering production MySQL records or queuing commands in Redis.*

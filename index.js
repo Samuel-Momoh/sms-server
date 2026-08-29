@@ -416,6 +416,195 @@ const swaggerSpec = {
     },
 
     // ── GPS Telemetry Simulation ──────────────────────────────────────────────
+    '/api/gps/devices/simulate-trip': {
+      post: {
+        tags: ['GPS Simulation & Testing'],
+        summary: 'Stream Real-Time Route from Log Array or Coordinates (In-Memory Testing)',
+        description: 'Simulates a live vehicle trip by streaming an array of telemetry log objects or coordinates sequentially to the `gps:update` WebSocket event every 10 seconds (configurable via `intervalMs`). **Database remains 100% untouched** (no fake records saved in MySQL).',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                oneOf: [
+                  {
+                    type: 'array',
+                    description: 'Raw array of HQ_GPS_UPDATE log objects from server logs',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        id: { type: 'string', example: '1787599508144_zqka7u' },
+                        ts: { type: 'string', example: '2026-08-24T19:25:08.144Z' },
+                        level: { type: 'string', example: 'INFO' },
+                        event: { type: 'string', example: 'HQ_GPS_UPDATE' },
+                        protocol: { type: 'string', example: 'HQ' },
+                        cmd: { type: 'string', example: 'V1' },
+                        imei: { type: 'string', example: '867232054850970' },
+                        remote: { type: 'string', example: '197.210.54.228:11610' },
+                        latitude: { type: 'number', example: 4.898115 },
+                        longitude: { type: 'number', example: 6.907373 },
+                        speed: { type: 'number', example: 35 },
+                        speed_knots: { type: 'number', example: 18.9 },
+                        speed_kmh: { type: 'number', example: 35 },
+                        direction: { type: 'number', example: 160 },
+                        gpsStatus: { type: 'string', example: 'A' },
+                        accOn: { type: 'boolean', example: true },
+                        isBackupBattery: { type: 'boolean', example: false },
+                        isOilCut: { type: 'boolean', example: false },
+                        equStatusHex: { type: 'string', example: 'FFFFFBFF' },
+                        timestamp: { type: 'string', example: '2026-08-24 19:25:06 UTC' },
+                      },
+                    },
+                    example: [
+                      {
+                        id: '1787599508144_zqka7u',
+                        ts: '2026-08-24T19:25:08.144Z',
+                        level: 'INFO',
+                        event: 'HQ_GPS_UPDATE',
+                        protocol: 'HQ',
+                        cmd: 'V1',
+                        imei: '867232054850970',
+                        remote: '197.210.54.228:11610',
+                        latitude: 4.898115,
+                        longitude: 6.907373,
+                        speed: 0,
+                        speed_knots: 0,
+                        speed_kmh: 0,
+                        direction: 160,
+                        gpsStatus: 'A',
+                        accOn: false,
+                        isBackupBattery: false,
+                        isOilCut: false,
+                        equStatusHex: 'FFFFFBFF',
+                        timestamp: '2026-08-24 19:25:06 UTC',
+                      },
+                      {
+                        id: '1787599518144_abc123',
+                        ts: '2026-08-24T19:25:18.144Z',
+                        level: 'INFO',
+                        event: 'HQ_GPS_UPDATE',
+                        protocol: 'HQ',
+                        cmd: 'V1',
+                        imei: '867232054850970',
+                        latitude: 4.898520,
+                        longitude: 6.907710,
+                        speed: 35,
+                        speed_kmh: 35,
+                        direction: 165,
+                        gpsStatus: 'A',
+                        accOn: true,
+                        equStatusHex: 'FFFFFBFF',
+                        timestamp: '2026-08-24 19:25:16 UTC',
+                      },
+                    ],
+                  },
+                  {
+                    type: 'object',
+                    required: ['imei', 'coordinates'],
+                    properties: {
+                      imei: { type: 'string', example: '867232054850970', description: 'Tracker IMEI number' },
+                      coordinates: {
+                        type: 'array',
+                        description: 'List of log telemetry objects or [lat, lon] pairs',
+                        items: { type: 'object' },
+                      },
+                      intervalMs: { type: 'number', default: 10000, example: 10000, description: 'Milliseconds between steps (default: 10000ms = 10s)' },
+                      speed: { type: 'number', default: 40, example: 45 },
+                      accOn: { type: 'boolean', default: true, example: true },
+                      loop: { type: 'boolean', default: false, example: false },
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Trip simulation started successfully. Coordinates streaming every 10 seconds to WebSockets.' },
+          400: { description: 'Invalid IMEI or empty coordinates array' },
+        },
+      },
+    },
+
+    '/api/gps/devices/{imei}/simulate-trip': {
+      post: {
+        tags: ['GPS Simulation & Testing'],
+        summary: 'Stream Real-Time Route for Specific Device IMEI',
+        description: 'Simulates a live driving trip by streaming an array of telemetry log objects or coordinates sequentially for the device in the path parameter.',
+        parameters: [
+          { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970' },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                oneOf: [
+                  {
+                    type: 'array',
+                    items: { type: 'object' },
+                    example: [
+                      { latitude: 4.898115, longitude: 6.907373, speed_kmh: 0, direction: 160, accOn: false },
+                      { latitude: 4.898520, longitude: 6.907710, speed_kmh: 35, direction: 165, accOn: true },
+                    ],
+                  },
+                  {
+                    type: 'object',
+                    properties: {
+                      coordinates: { type: 'array', items: { type: 'object' } },
+                      intervalMs: { type: 'number', default: 10000, example: 10000 },
+                      loop: { type: 'boolean', default: false },
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Simulation started' },
+        },
+      },
+    },
+
+    '/api/gps/devices/simulate-trip/stop': {
+      post: {
+        tags: ['GPS Simulation & Testing'],
+        summary: 'Stop Active Trip Simulation',
+        description: 'Stops any ongoing coordinate stream simulation for the given IMEI.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['imei'],
+                properties: {
+                  imei: { type: 'string', example: '867232054850970' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Simulation stopped successfully' },
+        },
+      },
+    },
+
+    '/api/gps/devices/{imei}/simulate-trip/stop': {
+      post: {
+        tags: ['GPS Simulation & Testing'],
+        summary: 'Stop Active Trip Simulation for IMEI',
+        parameters: [
+          { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970' },
+        ],
+        responses: {
+          200: { description: 'Simulation stopped successfully' },
+        },
+      },
+    },
+
     '/api/gps/simulate': {
       post: {
         tags: ['GPS Simulation & Testing'],
@@ -442,7 +631,7 @@ const swaggerSpec = {
           },
         },
         responses: {
-          200: { description: 'Telemetry simulated, saved to MySQL, and broadcasted to WebSockets' },
+          200: { description: 'Telemetry simulated and broadcasted to WebSockets (database untouched)' },
           403: { description: 'Forbidden (Non-admin attempting to simulate on another user device)' },
         },
       },

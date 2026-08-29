@@ -32,7 +32,7 @@ const isRawDebug = () => process.env.GPS_RAW_DEBUG === 'true';
 const getKeepAliveDelay = () => parseInt(process.env.TCP_KEEPALIVE_DELAY, 10) || 300000;
 
 // Flag to auto-enforce continuous Mode 0 & 30s interval on connect/login
-const isAutoEnforceTracking = () => process.env.AUTO_ENFORCE_TRACKING !== 'false';
+const isAutoEnforceTracking = () => process.env.AUTO_ENFORCE_TRACKING === 'true';
 
 // ── Device registry: IMEI → socket ───────────────────────────────────────────
 const deviceRegistry = new Map();
@@ -1171,9 +1171,6 @@ function handleHqLogin(socket, imei, fields, state) {
 
   const ack = buildHqAck(imei, 'V0');
   sendHqResponse(socket, imei, ack);
-
-  // Auto-enforce continuous Mode 0 and 30s interval to prevent 30-min idle sleep
-  enforceContinuousTracking(socket, imei);
 }
 
 function handleHqGps(socket, imei, fields, state, cmd = 'V1') {
@@ -1284,20 +1281,35 @@ function handleHqGps(socket, imei, fields, state, cmd = 'V1') {
   const v4Timestamp = formatV1Timestamp(timeRaw, dateRaw);
   const ack = buildHqAck(imei, cmd, v4Timestamp);
   sendHqResponse(socket, imei, ack);
-
-  // Periodic keep-awake re-assertion if ACC is OFF (preventing 30-min idle sleep)
-  if (!vehicleStatus.accOn) {
-    const trackerState = socket._trackerState || {};
-    const now = Date.now();
-    if (!trackerState.lastEnforceAt || (now - trackerState.lastEnforceAt > 15 * 60 * 1000)) {
-      enforceContinuousTracking(socket, imei);
-    }
-  }
 }
 
 function handleHqHeartbeat(socket, imei, fields, state) {
-  if (state) state.lastActivityAt = new Date().toISOString();
-  else if (socket._trackerState) socket._trackerState.lastActivityAt = new Date().toISOString();
+  const nowIso = new Date().toISOString();
+  if (state) state.lastActivityAt = nowIso;
+  else if (socket._trackerState) socket._trackerState.lastActivityAt = nowIso;
+
+  const currentDevState = deviceStates.get(imei);
+  const isAccOff = currentDevState?.vehicleStatus?.accOn === false;
+
+  // If vehicle is parked with ACC off, ensure speed reflects 0.00
+  if (isAccOff && currentDevState?.lastLocation) {
+    currentDevState.lastLocation.speed_kmh = 0;
+    currentDevState.lastLocation.speed_knots = 0;
+    currentDevState.lastActivityAt = nowIso;
+    updateDeviceState(imei, {
+      lastLocation: currentDevState.lastLocation,
+      connected: true,
+      lastActivityAt: nowIso,
+    });
+  }
+
+  upsertDevice({
+    imei,
+    protocol: 'HQ',
+    connected: true,
+    speed_kmh: isAccOff ? 0 : undefined,
+    lastSeen: nowIso,
+  });
 
   logger.info('HQ_HEARTBEAT', {
     event: 'HQ_HEARTBEAT',
@@ -1310,7 +1322,7 @@ function handleHqHeartbeat(socket, imei, fields, state) {
     imei,
     protocol: 'HQ',
     remote: `${socket.remoteAddress}:${socket.remotePort}`,
-    timestamp: new Date().toISOString(),
+    timestamp: nowIso,
   });
 
   // Respond with HQ Heartbeat ACK: *HQ,<IMEI>,HTBT#\r\n
@@ -1356,6 +1368,123 @@ function handleHqConfirm(socket, imei, fields, state) {
   if (lastField && typeof lastField === 'string' && /^[0-9A-Fa-f]{8}$/.test(lastField)) {
     equStatus = lastField;
     vehicleStatus = parseEquStatus(lastField);
+  }
+
+  // Detect and extract embedded GPS telemetry in V4 replies (e.g. *HQ,IMEI,V4,D1,002148,001157,A,0453.2879,N,00654.7874,E,0.00,0,280826,FFFEFBFF#)
+  const gpsIdx = rest.findIndex((f, idx) => (f === 'A' || f === 'V' || f === 'B') && idx >= 1 && (rest[idx + 2] === 'N' || rest[idx + 2] === 'S'));
+  let embeddedGps = null;
+
+  if (gpsIdx !== -1 && rest.length >= gpsIdx + 8) {
+    const timeRaw = rest[gpsIdx - 1];
+    const gpsStatus = rest[gpsIdx];
+    const latRaw = rest[gpsIdx + 1];
+    const latHemi = rest[gpsIdx + 2];
+    const lonRaw = rest[gpsIdx + 3];
+    const lonHemi = rest[gpsIdx + 4];
+    const speedRaw = rest[gpsIdx + 5];
+    const directionRaw = rest[gpsIdx + 6];
+    const dateRaw = rest[gpsIdx + 7];
+    const equRaw = rest[gpsIdx + 8] || lastField;
+
+    if (equRaw && /^[0-9A-Fa-f]{8}$/.test(equRaw)) {
+      equStatus = equRaw;
+      vehicleStatus = parseEquStatus(equRaw);
+    }
+
+    const rawLatDecimal = nmeaToDecimal(latRaw || '', latHemi || '');
+    const rawLonDecimal = nmeaToDecimal(lonRaw || '', lonHemi || '');
+    const latitude = isNaN(rawLatDecimal) ? null : parseFloat(rawLatDecimal.toFixed(6));
+    const longitude = isNaN(rawLonDecimal) ? null : parseFloat(rawLonDecimal.toFixed(6));
+
+    const speedKnots = speedRaw ? parseFloat(speedRaw) : 0;
+    const validKnots = isNaN(speedKnots) ? 0 : speedKnots;
+    const speedKmh = parseFloat((validKnots * 1.852).toFixed(2));
+    const direction = directionRaw ? parseInt(directionRaw, 10) || 0 : 0;
+
+    let timestamp = '';
+    if (timeRaw && timeRaw.length >= 6) {
+      const hh = timeRaw.substring(0, 2);
+      const mm = timeRaw.substring(2, 4);
+      const ss = timeRaw.substring(4, 6);
+      if (dateRaw && dateRaw.length >= 6) {
+        const dd = dateRaw.substring(0, 2);
+        const mon = dateRaw.substring(2, 4);
+        const yy = dateRaw.substring(4, 6);
+        timestamp = `20${yy}-${mon}-${dd} ${hh}:${mm}:${ss} UTC`;
+      } else {
+        timestamp = `${hh}:${mm}:${ss}`;
+      }
+    }
+
+    if (latitude !== null && longitude !== null) {
+      embeddedGps = {
+        latitude,
+        longitude,
+        speed_kmh: speedKmh,
+        speed_knots: validKnots,
+        direction,
+        gpsStatus,
+        timestamp,
+      };
+
+      // 1. Update in-memory device state
+      updateDeviceState(imei, {
+        lastLocation: embeddedGps,
+        vehicleStatus: vehicleStatus || parseEquStatus(equStatus),
+        lastActivityAt: new Date().toISOString(),
+      });
+
+      // 2. Persist to MySQL database
+      saveLocationHistory({
+        imei,
+        latitude,
+        longitude,
+        speed_kmh: speedKmh,
+        direction,
+        accOn: vehicleStatus?.accOn || false,
+        gpsStatus,
+        timestamp,
+        raw_hex: fields.join(','),
+      });
+
+      upsertDevice({
+        imei,
+        protocol: 'HQ',
+        connected: true,
+        latitude,
+        longitude,
+        speed_kmh: speedKmh,
+        direction,
+        accOn: vehicleStatus?.accOn || false,
+        isOilCut: vehicleStatus?.isOilCut || false,
+        isBackupBattery: vehicleStatus?.isBackupBattery || false,
+        gpsStatus,
+        lastSeen: timestamp,
+      });
+
+      // 3. Emit real-time GPS update
+      gpsEventEmitter.emit('gps:update', {
+        event: 'HQ_GPS_UPDATE',
+        protocol: 'HQ',
+        cmd: `V4_${cmdConfirmed}`,
+        imei,
+        remote: `${socket.remoteAddress}:${socket.remotePort}`,
+        latitude,
+        longitude,
+        speed: speedKmh,
+        speed_knots: validKnots,
+        speed_kmh: speedKmh,
+        direction,
+        gpsStatus,
+        accOn: vehicleStatus?.accOn || false,
+        alarms: vehicleStatus?.alarms?.length > 0 ? vehicleStatus.alarms : undefined,
+        isBackupBattery: vehicleStatus?.isBackupBattery || false,
+        isOilCut: vehicleStatus?.isOilCut || false,
+        equStatusHex: equStatus,
+        timestamp,
+      });
+    }
+  } else if (vehicleStatus) {
     updateDeviceState(imei, {
       vehicleStatus,
       lastActivityAt: new Date().toISOString(),
@@ -1371,6 +1500,7 @@ function handleHqConfirm(socket, imei, fields, state) {
     status,
     equStatusHex: equStatus,
     vehicleStatus,
+    gps: embeddedGps,
     details: rest,
     timestamp: new Date().toISOString(),
   };
@@ -1478,12 +1608,20 @@ function handleHqPacket(socket, message, state) {
     case 'HTBT':
       handleHqHeartbeat(socket, imei, fields, state);
       break;
-    default:
+    default: {
       logger.warn('HQ_UNKNOWN_CMD', {
         remote: `${socket.remoteAddress}:${socket.remotePort}`,
         imei,
         cmd,
+        fields,
       });
+      // Check if this command contains embedded GPS coordinates
+      const gpsIdx = fields.findIndex((f, idx) => (f === 'A' || f === 'V' || f === 'B') && idx >= 1 && (fields[idx + 2] === 'N' || fields[idx + 2] === 'S'));
+      if (gpsIdx !== -1 && fields.length >= gpsIdx + 8) {
+        handleHqGps(socket, imei, fields, state, cmd);
+      }
+      break;
+    }
   }
 }
 

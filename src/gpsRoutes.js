@@ -693,6 +693,24 @@ router.get('/devices', async (req, res) => {
     for (const d of dbDevices) {
       const imei = String(d.imei);
       const memState = memoryStates.get(imei);
+      const isAccOn = memState?.vehicleStatus?.accOn !== undefined
+        ? memState.vehicleStatus.accOn
+        : Boolean(d.acc_on);
+
+      const loc = memState?.lastLocation ? { ...memState.lastLocation } : {
+        latitude: d.last_latitude ? parseFloat(d.last_latitude) : null,
+        longitude: d.last_longitude ? parseFloat(d.last_longitude) : null,
+        speed_kmh: isAccOn ? (d.speed_kmh ? parseFloat(d.speed_kmh) : 0) : 0,
+        direction: d.direction ? parseInt(d.direction, 10) : 0,
+        gpsStatus: d.gps_status || 'A',
+        timestamp: d.last_seen_at || null,
+      };
+
+      if (!isAccOn && loc) {
+        loc.speed_kmh = 0;
+        loc.speed_knots = 0;
+      }
+
       mergedMap.set(imei, {
         imei,
         name: d.name || `Vehicle ${imei.slice(-4)}`,
@@ -704,16 +722,9 @@ router.get('/devices', async (req, res) => {
         icon: d.icon || null,
         connected: memState ? memState.connected : Boolean(d.connected),
         lastSeenAt: memState?.lastActivityAt || d.last_seen_at || d.updated_at || null,
-        lastLocation: memState?.lastLocation || {
-          latitude: d.last_latitude ? parseFloat(d.last_latitude) : null,
-          longitude: d.last_longitude ? parseFloat(d.last_longitude) : null,
-          speed_kmh: d.speed_kmh ? parseFloat(d.speed_kmh) : 0,
-          direction: d.direction ? parseInt(d.direction, 10) : 0,
-          gpsStatus: d.gps_status || 'A',
-          timestamp: d.last_seen_at || null,
-        },
+        lastLocation: loc,
         vehicleStatus: memState?.vehicleStatus || {
-          accOn: Boolean(d.acc_on),
+          accOn: isAccOn,
           isOilCut: Boolean(d.is_oil_cut),
           isBackupBattery: Boolean(d.is_backup_battery),
           gpsFixed: d.gps_status === 'A',
@@ -727,7 +738,16 @@ router.get('/devices', async (req, res) => {
     for (const [imei, memState] of memoryStates.entries()) {
       if (!mergedMap.has(imei)) {
         if (req.user?.role === 'admin' || (memState.userId && String(memState.userId) === String(req.user?.id))) {
-          mergedMap.set(imei, memState);
+          const isAccOn = memState?.vehicleStatus?.accOn !== undefined ? memState.vehicleStatus.accOn : true;
+          const loc = memState.lastLocation ? { ...memState.lastLocation } : null;
+          if (!isAccOn && loc) {
+            loc.speed_kmh = 0;
+            loc.speed_knots = 0;
+          }
+          mergedMap.set(imei, {
+            ...memState,
+            lastLocation: loc,
+          });
         }
       }
     }
@@ -782,13 +802,14 @@ router.post('/devices', async (req, res) => {
   try {
     const registered = await registerNewDevice({
       imei: cleanImei,
-      name: name ? name.trim() : `Vehicle ${cleanImei.slice(-4)}`,
+      name: name.trim() || `Vehicle ${cleanImei.slice(-4)}`,
       plateNumber: finalPlate,
       simNumber: finalSim,
       model: finalModel,
-      userId: assignedUserId,
-      protocol: protocol || 'HQ',
+      protocol: protocol.trim() || 'HQ',
       icon: finalIcon,
+      userId: assignedUserId,
+      registeredBy: req.user?.username,
     });
 
     // Update in-memory state cache
@@ -831,49 +852,60 @@ router.post('/devices', async (req, res) => {
 // ── GET /api/gps/devices/:imei ────────────────────────────────────────────────
 router.get('/devices/:imei', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;
-  let device = getDeviceState(imei);
-  
-  if (!device) {
-    const dbDevice = await getDeviceByImei(imei);
-    if (dbDevice) {
-      device = {
-        imei: String(dbDevice.imei),
-        name: dbDevice.name || `Vehicle ${String(dbDevice.imei).slice(-4)}`,
-        plateNumber: dbDevice.plate_number || dbDevice.plateNumber || '',
-        simNumber: dbDevice.sim_number || dbDevice.simNumber || '',
-        model: dbDevice.model || 'Cantrack G02',
-        protocol: dbDevice.protocol || 'HQ',
-        userId: dbDevice.user_id || dbDevice.userId || null,
-        icon: dbDevice.icon || null,
-        connected: false,
-        lastSeenAt: dbDevice.last_seen_at || dbDevice.updated_at || null,
-        lastLocation: {
-          latitude: dbDevice.last_latitude ? parseFloat(dbDevice.last_latitude) : null,
-          longitude: dbDevice.last_longitude ? parseFloat(dbDevice.last_longitude) : null,
-          speed_kmh: dbDevice.speed_kmh ? parseFloat(dbDevice.speed_kmh) : 0,
-          direction: dbDevice.direction ? parseInt(dbDevice.direction, 10) : 0,
-          gpsStatus: dbDevice.gps_status || 'A',
-          timestamp: dbDevice.last_seen_at || null,
-        },
-        vehicleStatus: {
-          accOn: Boolean(dbDevice.acc_on),
-          isOilCut: Boolean(dbDevice.is_oil_cut),
-          isBackupBattery: Boolean(dbDevice.is_backup_battery),
-          gpsFixed: dbDevice.gps_status === 'A',
-          doorOpen: false,
-          alarms: [],
-        },
-      };
-    }
-  }
+  const memDevice = getDeviceState(imei);
+  const dbDevice = await getDeviceByImei(imei);
 
-  if (!device) {
+  if (!memDevice && !dbDevice) {
     return res.status(404).json({
       success: false,
       error: `Device ${imei} not found in registry or database`,
       connected: false,
     });
   }
+
+  const isConnected = isDeviceConnected(imei);
+  const isAccOn = memDevice?.vehicleStatus?.accOn !== undefined
+    ? memDevice.vehicleStatus.accOn
+    : Boolean(dbDevice?.acc_on);
+
+  const loc = memDevice?.lastLocation ? { ...memDevice.lastLocation } : (dbDevice?.last_latitude ? {
+    latitude: parseFloat(dbDevice.last_latitude),
+    longitude: parseFloat(dbDevice.last_longitude),
+    speed_kmh: isAccOn ? (dbDevice.speed_kmh ? parseFloat(dbDevice.speed_kmh) : 0) : 0,
+    speed_knots: isAccOn ? parseFloat(((dbDevice.speed_kmh || 0) / 1.852).toFixed(2)) : 0,
+    direction: dbDevice.direction ? parseInt(dbDevice.direction, 10) : 0,
+    gpsStatus: dbDevice.gps_status || 'A',
+    timestamp: dbDevice.last_seen_at || null,
+  } : null);
+
+  if (!isAccOn && loc) {
+    loc.speed_kmh = 0;
+    loc.speed_knots = 0;
+  }
+
+  const device = {
+    ...(memDevice || {}),
+    imei: String(imei),
+    name: dbDevice?.name || memDevice?.name || `Vehicle ${String(imei).slice(-4)}`,
+    plateNumber: dbDevice?.plate_number || dbDevice?.plateNumber || memDevice?.plateNumber || '',
+    simNumber: dbDevice?.sim_number || dbDevice?.simNumber || memDevice?.simNumber || '',
+    model: dbDevice?.model || memDevice?.model || 'Cantrack G02',
+    protocol: dbDevice?.protocol || memDevice?.protocol || 'HQ',
+    userId: dbDevice?.user_id || dbDevice?.userId || memDevice?.userId || null,
+    icon: dbDevice?.icon || memDevice?.icon || null,
+    connected: isConnected,
+    lastSeenAt: memDevice?.lastActivityAt || dbDevice?.last_seen_at || dbDevice?.updated_at || null,
+    lastLocation: loc,
+    vehicleStatus: memDevice?.vehicleStatus || {
+      accOn: isAccOn,
+      isOilCut: Boolean(dbDevice?.is_oil_cut),
+      isBackupBattery: Boolean(dbDevice?.is_backup_battery),
+      gpsFixed: dbDevice?.gps_status === 'A',
+      doorOpen: false,
+      alarms: [],
+    },
+  };
+
   res.json({ success: true, device });
 });
 
@@ -1498,7 +1530,302 @@ async function handleSimulateTelemetry(req, res) {
   });
 }
 
+// ── Continuous Coordinate Array Route Simulator (In-Memory Testing) ───────────
+const activeSimulations = new Map(); // imei -> { timer, isRunning, currentIndex, totalPoints, intervalMs }
+
+function stopTripSimulation(imei) {
+  const cleanImei = String(imei || '').trim();
+  const sim = activeSimulations.get(cleanImei);
+  if (sim && sim.timer) {
+    clearInterval(sim.timer);
+    activeSimulations.delete(cleanImei);
+    logger.info('GPS_TRIP_SIMULATION_STOPPED', { imei: cleanImei });
+    return true;
+  }
+  return false;
+}
+
+function handleSimulateTrip(req, res) {
+  // Support both object wrapper { imei, coordinates: [...] } and raw array in body [...]
+  const bodyIsArray = Array.isArray(req.body);
+  const rawCoords = bodyIsArray
+    ? req.body
+    : (req.body?.coordinates || req.body?.coords || req.body?.points || req.body?.path || req.body?.items || req.body?.telemetry || []);
+
+  const firstItemImei = Array.isArray(rawCoords) && rawCoords[0]?.imei ? String(rawCoords[0].imei).trim() : '';
+  const targetImei = (req.params?.imei || (!bodyIsArray ? (req.body?.imei || req.body?.deviceImei) : '') || firstItemImei || '').trim();
+
+  let intervalMs = 10000;
+  if (!bodyIsArray && req.body?.intervalMs) {
+    intervalMs = parseInt(req.body.intervalMs, 10);
+  } else if (!bodyIsArray && req.body?.intervalSeconds) {
+    intervalMs = parseInt(req.body.intervalSeconds, 10) * 1000;
+  } else if (req.query?.intervalMs) {
+    intervalMs = parseInt(req.query.intervalMs, 10);
+  } else if (req.query?.intervalSeconds) {
+    intervalMs = parseInt(req.query.intervalSeconds, 10) * 1000;
+  }
+  if (isNaN(intervalMs) || intervalMs < 100) intervalMs = 10000;
+
+  const isLoop = Boolean(!bodyIsArray && (req.body?.loop === true || req.body?.loop === 'true'));
+  const defaultSpeed = parseFloat((!bodyIsArray && (req.body?.speed || req.body?.speedKmh)) || 40);
+  const defaultAccOn = (!bodyIsArray && req.body?.accOn !== undefined) ? Boolean(req.body.accOn) : true;
+
+  if (!targetImei) {
+    return res.status(400).json({
+      success: false,
+      error: 'imei is required (either in URL, body.imei, or inside each coordinate object)',
+    });
+  }
+
+  if (!Array.isArray(rawCoords) || rawCoords.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'coordinates must be a non-empty array of telemetry objects or [latitude, longitude] pairs',
+    });
+  }
+
+  // Parse and normalize coordinate items
+  const normalizedCoords = [];
+  for (let i = 0; i < rawCoords.length; i++) {
+    const item = rawCoords[i];
+    let lat, lon;
+    let speed = defaultSpeed;
+    let speedKnots = 0;
+    let speedKmh = defaultSpeed;
+    let heading = 0;
+    let accOn = defaultAccOn;
+    let gpsStatus = 'A';
+    let isBackupBattery = false;
+    let isOilCut = false;
+    let equStatusHex = 'FFFFFBFF';
+    let timestamp = '';
+    let rawObj = {};
+
+    if (Array.isArray(item)) {
+      if (item.length >= 2) {
+        lat = parseFloat(item[0]);
+        lon = parseFloat(item[1]);
+      }
+    } else if (typeof item === 'object' && item !== null) {
+      rawObj = item;
+      lat = parseFloat(item.latitude !== undefined ? item.latitude : item.lat);
+      lon = parseFloat(item.longitude !== undefined ? item.longitude : (item.lon !== undefined ? item.lon : item.lng));
+
+      if (item.speed_kmh !== undefined) speedKmh = parseFloat(item.speed_kmh);
+      else if (item.speed !== undefined) speedKmh = parseFloat(item.speed);
+      else if (item.speedKmh !== undefined) speedKmh = parseFloat(item.speedKmh);
+
+      if (item.speed_knots !== undefined) speedKnots = parseFloat(item.speed_knots);
+      else speedKnots = parseFloat((speedKmh / 1.852).toFixed(2));
+
+      if (item.direction !== undefined) heading = parseInt(item.direction, 10) || 0;
+      else if (item.heading !== undefined) heading = parseInt(item.heading, 10) || 0;
+
+      if (item.accOn !== undefined) accOn = Boolean(item.accOn);
+      if (item.gpsStatus) gpsStatus = String(item.gpsStatus).trim();
+      if (item.isBackupBattery !== undefined) isBackupBattery = Boolean(item.isBackupBattery);
+      if (item.isOilCut !== undefined) isOilCut = Boolean(item.isOilCut);
+      if (item.equStatusHex) equStatusHex = String(item.equStatusHex).trim();
+      if (item.timestamp) timestamp = String(item.timestamp).trim();
+    }
+
+    if (!isNaN(lat) && !isNaN(lon)) {
+      // Auto compute heading between successive points if not explicitly specified
+      if (heading === 0 && normalizedCoords.length > 0) {
+        const prev = normalizedCoords[normalizedCoords.length - 1];
+        const dLat = lat - prev.latitude;
+        const dLon = lon - prev.longitude;
+        const angle = Math.atan2(dLon, dLat) * (180 / Math.PI);
+        heading = Math.round((angle + 360) % 360);
+      }
+
+      normalizedCoords.push({
+        ...rawObj,
+        latitude: parseFloat(lat.toFixed(6)),
+        longitude: parseFloat(lon.toFixed(6)),
+        speed: speedKmh,
+        speed_knots: isNaN(speedKnots) ? 0 : speedKnots,
+        speed_kmh: isNaN(speedKmh) ? 0 : speedKmh,
+        direction: heading,
+        gpsStatus,
+        accOn,
+        isBackupBattery,
+        isOilCut,
+        equStatusHex,
+        timestamp,
+      });
+    }
+  }
+
+  if (normalizedCoords.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'No valid latitude/longitude coordinates could be parsed from input array',
+    });
+  }
+
+  // Stop any ongoing simulation for this device
+  stopTripSimulation(targetImei);
+
+  // Emit virtual connection status
+  gpsEventEmitter.emit('gps:connected', {
+    imei: targetImei,
+    connected: true,
+    protocol: 'HQ',
+    remote: 'simulation:virtual',
+    timestamp: new Date().toISOString(),
+    isSimulation: true,
+  });
+
+  let currentIndex = 0;
+
+  function broadcastNextPoint() {
+    if (currentIndex >= normalizedCoords.length) {
+      if (isLoop) {
+        currentIndex = 0;
+      } else {
+        stopTripSimulation(targetImei);
+        gpsEventEmitter.emit('gps:simulation_finished', {
+          imei: targetImei,
+          totalPoints: normalizedCoords.length,
+          timestamp: new Date().toISOString(),
+        });
+        logger.info('GPS_TRIP_SIMULATION_COMPLETED', {
+          imei: targetImei,
+          totalPoints: normalizedCoords.length,
+        });
+        return;
+      }
+    }
+
+    const pt = normalizedCoords[currentIndex];
+    const now = new Date();
+    const formattedTs = pt.timestamp || (now.toISOString().replace('T', ' ').substring(0, 19) + ' UTC');
+
+    const payload = {
+      id: pt.id || `${Date.now()}_sim${currentIndex}`,
+      ts: pt.ts || now.toISOString(),
+      level: pt.level || 'INFO',
+      event: 'HQ_GPS_UPDATE',
+      protocol: pt.protocol || 'HQ',
+      cmd: pt.cmd || 'V1',
+      imei: targetImei,
+      remote: pt.remote || 'simulation:virtual',
+      latitude: pt.latitude,
+      longitude: pt.longitude,
+      speed: pt.speed !== undefined ? pt.speed : pt.speed_kmh,
+      speed_knots: pt.speed_knots,
+      speed_kmh: pt.speed_kmh,
+      direction: pt.direction || 0,
+      gpsStatus: pt.gpsStatus || 'A',
+      accOn: pt.accOn,
+      isBackupBattery: pt.isBackupBattery,
+      isOilCut: pt.isOilCut,
+      equStatusHex: pt.equStatusHex,
+      timestamp: formattedTs,
+      isSimulation: true,
+      step: currentIndex + 1,
+      totalSteps: normalizedCoords.length,
+    };
+
+    // 1. Update in-memory device state cache (for instant GET /devices/:imei queries)
+    updateDeviceState(targetImei, {
+      lastLocation: {
+        latitude: pt.latitude,
+        longitude: pt.longitude,
+        speed_kmh: pt.speed_kmh,
+        speed_knots: pt.speed_knots,
+        direction: pt.direction || 0,
+        gpsStatus: pt.gpsStatus || 'A',
+        timestamp: formattedTs,
+      },
+      vehicleStatus: {
+        accOn: pt.accOn,
+        isOilCut: pt.isOilCut,
+        isBackupBattery: pt.isBackupBattery,
+        gpsFixed: pt.gpsStatus === 'A',
+        alarms: [],
+      },
+      connected: true,
+      lastActivityAt: now.toISOString(),
+    });
+
+    // 2. Stream live update to WebSockets (Socket.io room for device IMEI + admin 'all' room)
+    // Note: saveLocationHistory is intentionally omitted so database remains untouched!
+    gpsEventEmitter.emit('gps:update', payload);
+
+    logger.info('GPS_TRIP_SIMULATION_TICK', {
+      imei: targetImei,
+      step: `${currentIndex + 1}/${normalizedCoords.length}`,
+      lat: pt.latitude,
+      lon: pt.longitude,
+      speed_kmh: pt.speed_kmh,
+      accOn: pt.accOn,
+    });
+
+    currentIndex++;
+  }
+
+  // Immediately send the first coordinate
+  broadcastNextPoint();
+
+  // Schedule subsequent coordinate emissions at the configured interval
+  const timer = setInterval(broadcastNextPoint, intervalMs);
+  activeSimulations.set(targetImei, {
+    timer,
+    isRunning: true,
+    totalPoints: normalizedCoords.length,
+    intervalMs,
+    loop: isLoop,
+    startedAt: new Date().toISOString(),
+  });
+
+  logger.info('GPS_TRIP_SIMULATION_STARTED', {
+    imei: targetImei,
+    totalPoints: normalizedCoords.length,
+    intervalMs,
+    loop: isLoop,
+  });
+
+  return res.json({
+    success: true,
+    message: `Trip simulation started for device ${targetImei}. Coordinates are streaming live to 'gps:update' every ${intervalMs}ms. Database remains completely untouched.`,
+    imei: targetImei,
+    totalPoints: normalizedCoords.length,
+    intervalMs,
+    loop: isLoop,
+    firstPoint: normalizedCoords[0],
+    lastPoint: normalizedCoords[normalizedCoords.length - 1],
+  });
+}
+
+function handleStopSimulateTrip(req, res) {
+  const targetImei = (req.params?.imei || req.body?.imei || req.body?.deviceImei || '').trim();
+  if (!targetImei) {
+    return res.status(400).json({
+      success: false,
+      error: 'imei is required to stop trip simulation',
+    });
+  }
+
+  const wasStopped = stopTripSimulation(targetImei);
+  return res.json({
+    success: true,
+    message: wasStopped
+      ? `Trip simulation stopped for device ${targetImei}.`
+      : `No active trip simulation was running for device ${targetImei}.`,
+    imei: targetImei,
+    wasRunning: wasStopped,
+  });
+}
+
 router.post('/simulate', handleSimulateTelemetry);
 router.post('/devices/:imei/simulate', handleSimulateTelemetry);
+
+router.post('/devices/simulate-trip', handleSimulateTrip);
+router.post('/devices/:imei/simulate-trip', handleSimulateTrip);
+router.post('/devices/simulate-trip/stop', handleStopSimulateTrip);
+router.post('/devices/:imei/simulate-trip/stop', handleStopSimulateTrip);
 
 module.exports = router;

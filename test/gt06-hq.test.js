@@ -183,8 +183,7 @@ async function runTests() {
   const ackLogC = capturedLogs.find((l) => l.event === 'HQ_ACK_SENT' && l.data.responseAscii.includes('V0'));
   assert(ackLogC, 'Expected HQ_ACK_SENT log event for V0 login');
   assert.strictEqual(ackLogC.data.responseAscii, '*HQ,867232054850970,V0#');
-  assert.strictEqual(ackLogC.data.responseHex, Buffer.from('*HQ,867232054850970,V0#').toString('hex'));
-  assert(mockSockC.written[1].includes('#tracker#') || mockSockC.written[1].includes('WKMD'), 'Expected auto-enforce tracker command sent on login');
+  assert.strictEqual(mockSockC.written[0], '*HQ,867232054850970,V0#', 'Expected clean V0 login ACK');
   console.log('✅ Test C Passed!\n');
 
   // ───────────────────────────────────────────────────────────────────────────
