@@ -509,14 +509,6 @@ function sendDeviceCommand(imei, commandOrCmd, params = [], options = {}) {
 
   const socket = deviceRegistry.get(imei);
   if (!socket || socket.destroyed) {
-    // Check if this is an active tester simulation device
-    try {
-      const { isTesterSimulationActive, handleTesterCommand } = require('./services/testerSimulator');
-      if (isTesterSimulationActive(imei)) {
-        return handleTesterCommand(imei, commandOrCmd, params);
-      }
-    } catch (_) {}
-
     return Promise.resolve({
       success: false,
       error: `Device ${imei} is not connected or TCP socket is closed`,
@@ -2015,15 +2007,7 @@ module.exports = {
   getConnectedDevices,
   getDeviceState,
   updateDeviceState,
-  isDeviceConnected: (imei) => {
-    if (!imei) return false;
-    if (deviceRegistry.has(imei)) return true;
-    try {
-      const { isTesterSimulationActive } = require('./services/testerSimulator');
-      if (isTesterSimulationActive(imei)) return true;
-    } catch (_) {}
-    return false;
-  },
+  isDeviceConnected: (imei) => deviceRegistry.has(imei),
   _processBuffer: processBuffer,
   _processHqBuffer: processHqBuffer,
   _processGt06Buffer: processGt06Buffer,

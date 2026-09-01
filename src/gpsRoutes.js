@@ -55,13 +55,6 @@ const {
   requireAdmin,
 } = require('./adminAuth');
 const { logger, getRecentLogs, clearRecentLogs } = require('./logger');
-const {
-  isTesterUser,
-  isTesterDevice,
-  triggerTesterSimulationIfIdle,
-  handleTesterCommand,
-  isTesterSimulationActive,
-} = require('./services/testerSimulator');
 
 const router = express.Router();
 
@@ -117,16 +110,6 @@ async function requireDeviceAccess(req, res, next) {
 
 // Helper to send command immediately or queue if device is sleeping/offline
 async function dispatchOrQueue(imei, cmdCode, params = [], req, res, sendFn = sendDeviceCommand) {
-  if (isTesterUser(req.user) || isTesterSimulationActive(imei)) {
-    const result = await handleTesterCommand(imei, cmdCode, params);
-    return res.json({
-      success: true,
-      queued: false,
-      message: result.message || `Command ${cmdCode} processed successfully for device ${imei}`,
-      result,
-    });
-  }
-
   const result = await enqueueCommand(imei, cmdCode, params, {}, sendFn, isDeviceConnected);
   if (!result.success && !result.queued) {
     return res.status(500).json(result);
@@ -772,44 +755,6 @@ router.get('/devices', async (req, res) => {
 
     const deviceList = Array.from(mergedMap.values());
 
-    // For tester@gmail.com, ensure demo vehicle and trigger background 1-minute TomTom simulation
-    if (isTesterUser(req.user)) {
-      if (deviceList.length === 0) {
-        const defaultTesterImei = '867232054850970';
-        deviceList.push({
-          imei: defaultTesterImei,
-          name: 'Toyota Camry - Tester Demo',
-          plateNumber: 'TST-777-NG',
-          simNumber: '+2348099887766',
-          model: 'Cantrack G02',
-          protocol: 'HQ',
-          userId: req.user.id,
-          connected: true,
-          lastSeenAt: new Date().toISOString(),
-          lastLocation: {
-            latitude: 4.898115,
-            longitude: 6.907373,
-            speed_kmh: 42.0,
-            direction: 160,
-            gpsStatus: 'A',
-            timestamp: new Date().toISOString(),
-          },
-          vehicleStatus: {
-            accOn: true,
-            isOilCut: false,
-            isBackupBattery: false,
-            gpsFixed: true,
-            doorOpen: false,
-            alarms: [],
-          },
-        });
-      }
-
-      for (const dev of deviceList) {
-        triggerTesterSimulationIfIdle(dev.imei, req.user);
-      }
-    }
-
     res.json({
       success: true,
       count: deviceList.length,
@@ -1002,10 +947,6 @@ router.get('/devices/:imei', requireDeviceAccess, async (req, res) => {
       alarms: [],
     },
   };
-
-  if (isTesterUser(req.user)) {
-    triggerTesterSimulationIfIdle(imei, req.user);
-  }
 
   res.json({ success: true, device });
 });
