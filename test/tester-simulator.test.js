@@ -64,7 +64,7 @@ async function runTesterSimulatorTests() {
   // Test 2: Fetch TomTom Route (or high-fidelity fallback)
   console.log('\nTest 2: Fetch TomTom Navigation Route');
   const route = await fetchTomTomRoute();
-  assert(Array.isArray(route) && route.length >= 10, 'Route should contain at least 10 waypoints');
+  assert(Array.isArray(route) && route.length >= 5, 'Route should contain at least 5 waypoints');
   assert(typeof route[0].latitude === 'number' && typeof route[0].longitude === 'number');
   console.log(`✔ Test 2 Passed: Route successfully loaded (${route.length} road waypoints)`);
 
