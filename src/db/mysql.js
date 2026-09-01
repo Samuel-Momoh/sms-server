@@ -5,9 +5,10 @@ const { hashPassword } = require('../adminAuth');
 let pool = null;
 let isConnected = false;
 
-// In-memory user & device fallback store when MySQL is offline
+// In-memory user, device, and location history fallback store when MySQL is offline
 const memoryUsers = new Map();
 const memoryDevices = new Map();
+const memoryLocationHistory = [];
 
 /**
  * Initialize MySQL connection pool, ensure required tables exist, and seed default admin.
@@ -791,6 +792,13 @@ async function deleteDevice(imei) {
   const targetImei = String(imei).trim();
   memoryDevices.delete(targetImei);
 
+  // Clean in-memory location history
+  for (let i = memoryLocationHistory.length - 1; i >= 0; i--) {
+    if (memoryLocationHistory[i].imei === targetImei) {
+      memoryLocationHistory.splice(i, 1);
+    }
+  }
+
   if (!pool || !isConnected) return true;
 
   try {
@@ -871,13 +879,32 @@ async function upsertDevice(dev) {
  * Save a trajectory waypoint to location_history.
  */
 async function saveLocationHistory(loc) {
-  if (!pool || !isConnected || !loc?.imei || isNaN(loc.latitude) || isNaN(loc.longitude)) return;
+  if (!loc?.imei || isNaN(loc.latitude) || isNaN(loc.longitude)) return;
+
+  const rawDate = loc.timestamp || loc.ts || new Date();
+  const recordedAt = new Date(rawDate);
+  const validDate = isNaN(recordedAt.getTime()) ? new Date() : recordedAt;
+
+  if (!pool || !isConnected) {
+    memoryLocationHistory.push({
+      id: memoryLocationHistory.length + 1,
+      imei: String(loc.imei).trim(),
+      latitude: parseFloat(Number(loc.latitude).toFixed(6)),
+      longitude: parseFloat(Number(loc.longitude).toFixed(6)),
+      speed_kmh: parseFloat(loc.speed_kmh || 0),
+      direction: parseFloat(loc.direction || 0),
+      acc_on: loc.accOn ? 1 : 0,
+      accOn: Boolean(loc.accOn),
+      gps_status: loc.gpsStatus || 'A',
+      gpsStatus: loc.gpsStatus || 'A',
+      raw_data: loc.raw_hex || loc.ascii || null,
+      recorded_at: validDate.toISOString(),
+      created_at: new Date().toISOString(),
+    });
+    return;
+  }
 
   try {
-    const rawDate = loc.timestamp || loc.ts || new Date();
-    const recordedAt = new Date(rawDate);
-    const validDate = isNaN(recordedAt.getTime()) ? new Date() : recordedAt;
-
     const sql = `
       INSERT INTO location_history (
         imei, latitude, longitude, speed_kmh, direction, acc_on, gps_status, raw_data, recorded_at
@@ -961,27 +988,166 @@ async function updateCommandStatus(commandId, status, extra = {}) {
 
 /**
  * Retrieve trajectory history for an IMEI.
+ * Supports pagination, date range filtering (since/from/until/to), and sorting (ASC/DESC).
  */
-async function getLocationHistory(imei, limit = 100, since = null) {
-  if (!pool || !isConnected || !imei) return [];
+async function getLocationHistory(imei, limitOrOptions = 100, maybeSince = null) {
+  if (!imei) return [];
 
-  try {
-    let sql = 'SELECT * FROM location_history WHERE imei = ?';
-    const params = [imei];
+  const targetImei = String(imei).trim();
 
-    if (since) {
-      sql += ' AND recorded_at >= ?';
-      params.push(new Date(since));
+  let limit = 100;
+  let offset = 0;
+  let since = null;
+  let until = null;
+  let order = 'DESC';
+
+  if (typeof limitOrOptions === 'object' && limitOrOptions !== null) {
+    limit = Math.min(parseInt(limitOrOptions.limit, 10) || 100, 1000);
+    if (limit < 1) limit = 100;
+
+    if (limitOrOptions.offset !== undefined) {
+      offset = Math.max(parseInt(limitOrOptions.offset, 10) || 0, 0);
+    } else if (limitOrOptions.page) {
+      const page = Math.max(parseInt(limitOrOptions.page, 10) || 1, 1);
+      offset = (page - 1) * limit;
     }
 
-    sql += ' ORDER BY recorded_at DESC LIMIT ?';
-    params.push(Math.min(parseInt(limit, 10) || 100, 1000));
+    since = limitOrOptions.since || limitOrOptions.from || limitOrOptions.startDate || null;
+    until = limitOrOptions.until || limitOrOptions.to || limitOrOptions.endDate || null;
 
-    const [rows] = await pool.query(sql, params);
-    return rows;
+    if (typeof limitOrOptions.order === 'string' && limitOrOptions.order.toUpperCase() === 'ASC') {
+      order = 'ASC';
+    }
+  } else {
+    limit = Math.min(parseInt(limitOrOptions, 10) || 100, 1000);
+    if (limit < 1) limit = 100;
+    since = maybeSince;
+  }
+
+  // Fallback to in-memory store if MySQL is not connected
+  if (!pool || !isConnected) {
+    let list = memoryLocationHistory.filter((r) => String(r.imei) === targetImei);
+
+    if (since) {
+      const sinceDate = new Date(since).getTime();
+      if (!isNaN(sinceDate)) {
+        list = list.filter((r) => new Date(r.recorded_at).getTime() >= sinceDate);
+      }
+    }
+
+    if (until) {
+      const untilDate = new Date(until).getTime();
+      if (!isNaN(untilDate)) {
+        list = list.filter((r) => new Date(r.recorded_at).getTime() <= untilDate);
+      }
+    }
+
+    list.sort((a, b) => {
+      const timeA = new Date(a.recorded_at).getTime();
+      const timeB = new Date(b.recorded_at).getTime();
+      return order === 'ASC' ? timeA - timeB : timeB - timeA;
+    });
+
+    return list.slice(offset, offset + limit);
+  }
+
+  try {
+    let whereSql = 'WHERE imei = ?';
+    const params = [targetImei];
+
+    if (since) {
+      const sinceDate = new Date(since);
+      if (!isNaN(sinceDate.getTime())) {
+        whereSql += ' AND recorded_at >= ?';
+        params.push(sinceDate);
+      }
+    }
+
+    if (until) {
+      const untilDate = new Date(until);
+      if (!isNaN(untilDate.getTime())) {
+        whereSql += ' AND recorded_at <= ?';
+        params.push(untilDate);
+      }
+    }
+
+    const sql = `SELECT * FROM location_history ${whereSql} ORDER BY recorded_at ${order} LIMIT ? OFFSET ?`;
+    const [rows] = await pool.query(sql, [...params, limit, offset]);
+
+    return rows.map((r) => ({
+      id: r.id,
+      imei: r.imei,
+      latitude: parseFloat(r.latitude),
+      longitude: parseFloat(r.longitude),
+      speed_kmh: parseFloat(r.speed_kmh || 0),
+      direction: parseFloat(r.direction || 0),
+      accOn: Boolean(r.acc_on),
+      acc_on: r.acc_on,
+      gpsStatus: r.gps_status || 'A',
+      gps_status: r.gps_status || 'A',
+      rawData: r.raw_data || undefined,
+      recorded_at: r.recorded_at ? new Date(r.recorded_at).toISOString() : null,
+      created_at: r.created_at ? new Date(r.created_at).toISOString() : null,
+    }));
   } catch (err) {
-    logger.error('MYSQL_GET_HISTORY_ERROR', { imei, error: err.message });
+    logger.error('MYSQL_GET_HISTORY_ERROR', { imei: targetImei, error: err.message });
     return [];
+  }
+}
+
+/**
+ * Get total count of location history records for an IMEI within optional date range.
+ */
+async function getLocationHistoryCount(imei, { since = null, until = null } = {}) {
+  if (!imei) return 0;
+  const targetImei = String(imei).trim();
+
+  // Fallback to in-memory store if MySQL is not connected
+  if (!pool || !isConnected) {
+    let list = memoryLocationHistory.filter((r) => String(r.imei) === targetImei);
+
+    if (since) {
+      const sinceDate = new Date(since).getTime();
+      if (!isNaN(sinceDate)) {
+        list = list.filter((r) => new Date(r.recorded_at).getTime() >= sinceDate);
+      }
+    }
+
+    if (until) {
+      const untilDate = new Date(until).getTime();
+      if (!isNaN(untilDate)) {
+        list = list.filter((r) => new Date(r.recorded_at).getTime() <= untilDate);
+      }
+    }
+
+    return list.length;
+  }
+
+  try {
+    let whereSql = 'WHERE imei = ?';
+    const params = [targetImei];
+
+    if (since) {
+      const sinceDate = new Date(since);
+      if (!isNaN(sinceDate.getTime())) {
+        whereSql += ' AND recorded_at >= ?';
+        params.push(sinceDate);
+      }
+    }
+
+    if (until) {
+      const untilDate = new Date(until);
+      if (!isNaN(untilDate.getTime())) {
+        whereSql += ' AND recorded_at <= ?';
+        params.push(untilDate);
+      }
+    }
+
+    const [rows] = await pool.query(`SELECT COUNT(*) AS total FROM location_history ${whereSql}`, params);
+    return rows[0]?.total || 0;
+  } catch (err) {
+    logger.error('MYSQL_GET_HISTORY_COUNT_ERROR', { imei: targetImei, error: err.message });
+    return 0;
   }
 }
 
@@ -1026,6 +1192,7 @@ module.exports = {
   logCommand,
   updateCommandStatus,
   getLocationHistory,
+  getLocationHistoryCount,
   getCommandLogs,
   isMysqlConnected: () => isConnected,
   getPool: () => pool,

@@ -74,29 +74,29 @@ const swaggerSpec = {
         bearerFormat: 'JWT',
         description: 'JWT Bearer token obtained from POST /api/gps/auth/login. Passed as Authorization: Bearer <token>',
       },
-      BasicAuth: {
-        type: 'http',
-        scheme: 'basic',
-        description: 'Admin credentials (set in ADMIN_USER and ADMIN_PWD)',
-      },
-      AdminUserHeader: {
-        type: 'apiKey',
-        in: 'header',
-        name: 'x-admin-user',
-        description: 'Admin username header',
-      },
-      AdminPasswordHeader: {
-        type: 'apiKey',
-        in: 'header',
-        name: 'x-admin-pwd',
-        description: 'Admin password header',
-      },
+      // BasicAuth: {
+      //   type: 'http',
+      //   scheme: 'basic',
+      //   description: 'Admin credentials (set in ADMIN_USER and ADMIN_PWD)',
+      // },
+      // AdminUserHeader: {
+      //   type: 'apiKey',
+      //   in: 'header',
+      //   name: 'x-admin-user',
+      //   description: 'Admin username header',
+      // },
+      // AdminPasswordHeader: {
+      //   type: 'apiKey',
+      //   in: 'header',
+      //   name: 'x-admin-pwd',
+      //   description: 'Admin password header',
+      // },
     },
   },
   security: [
     { BearerAuth: [] },
-    { BasicAuth: [] },
-    { AdminUserHeader: [], AdminPasswordHeader: [] },
+    // { BasicAuth: [] },
+    // { AdminUserHeader: [], AdminPasswordHeader: [] },
   ],
   paths: {
     '/': {
@@ -356,6 +356,7 @@ const swaggerSpec = {
         responses: {
           201: { description: 'Device registered successfully' },
           400: { description: 'Invalid IMEI or request data' },
+          409: { description: 'Conflict: IMEI number is registered already (security alert email sent to registered owner)' },
         },
       },
     },
@@ -411,6 +412,98 @@ const swaggerSpec = {
           200: { description: 'Device and all records purged successfully' },
           403: { description: 'Forbidden' },
           404: { description: 'Device not found' },
+        },
+      },
+    },
+
+    '/api/gps/devices/{imei}/history': {
+      get: {
+        tags: ['GPS Devices', 'GPS History'],
+        summary: 'Get Historical Trajectory & Waypoints for a Vehicle',
+        description: 'Fetches persistent GPS location history from MySQL with pagination, date range filtering, and chronological or reverse sorting for route playback.',
+        parameters: [
+          { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970', description: 'Device IMEI' },
+          { in: 'query', name: 'limit', required: false, schema: { type: 'integer', default: 100 }, description: 'Max records to return (1-1000)' },
+          { in: 'query', name: 'page', required: false, schema: { type: 'integer', default: 1 }, description: 'Page number for pagination' },
+          { in: 'query', name: 'offset', required: false, schema: { type: 'integer', default: 0 }, description: 'Row offset for pagination' },
+          { in: 'query', name: 'since', required: false, schema: { type: 'string' }, example: '2026-08-25T00:00:00Z', description: 'Filter records on or after this ISO date/timestamp' },
+          { in: 'query', name: 'until', required: false, schema: { type: 'string' }, example: '2026-08-30T23:59:59Z', description: 'Filter records on or before this ISO date/timestamp' },
+          { in: 'query', name: 'order', required: false, schema: { type: 'string', enum: ['DESC', 'ASC'], default: 'DESC' }, description: 'Sort direction: DESC (newest first) or ASC (chronological for trip playback)' },
+        ],
+        responses: {
+          200: {
+            description: 'Location history retrieved successfully',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: true },
+                    imei: { type: 'string', example: '867232054850970' },
+                    count: { type: 'integer', example: 50 },
+                    total: { type: 'integer', example: 1250 },
+                    pagination: {
+                      type: 'object',
+                      properties: {
+                        limit: { type: 'integer', example: 50 },
+                        offset: { type: 'integer', example: 0 },
+                        page: { type: 'integer', example: 1 },
+                        totalPages: { type: 'integer', example: 25 },
+                        hasMore: { type: 'boolean', example: true },
+                      },
+                    },
+                    filter: {
+                      type: 'object',
+                      properties: {
+                        since: { type: 'string', example: '2026-08-25T00:00:00Z' },
+                        until: { type: 'string', example: '2026-08-30T23:59:59Z' },
+                        order: { type: 'string', example: 'DESC' },
+                      },
+                    },
+                    history: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          id: { type: 'integer', example: 101 },
+                          imei: { type: 'string', example: '867232054850970' },
+                          latitude: { type: 'number', example: 4.888047 },
+                          longitude: { type: 'number', example: 6.913142 },
+                          speed_kmh: { type: 'number', example: 35.5 },
+                          direction: { type: 'number', example: 180 },
+                          accOn: { type: 'boolean', example: true },
+                          gpsStatus: { type: 'string', example: 'A' },
+                          recorded_at: { type: 'string', example: '2026-08-29T17:54:00.000Z' },
+                          created_at: { type: 'string', example: '2026-08-29T17:54:01.000Z' },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          403: { description: 'Forbidden: You do not have permission to view this device' },
+          404: { description: 'Device not found' },
+        },
+      },
+    },
+
+    '/api/gps/history': {
+      get: {
+        tags: ['GPS History'],
+        summary: 'Get Location History by Query Parameter',
+        description: 'Alias endpoint for fetching trajectory history using query parameter `?imei=867232054850970`.',
+        parameters: [
+          { in: 'query', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970', description: 'Device IMEI' },
+          { in: 'query', name: 'limit', required: false, schema: { type: 'integer', default: 100 }, description: 'Max records to return' },
+          { in: 'query', name: 'page', required: false, schema: { type: 'integer', default: 1 }, description: 'Page number' },
+          { in: 'query', name: 'since', required: false, schema: { type: 'string' }, description: 'Start date/timestamp' },
+          { in: 'query', name: 'until', required: false, schema: { type: 'string' }, description: 'End date/timestamp' },
+          { in: 'query', name: 'order', required: false, schema: { type: 'string', enum: ['DESC', 'ASC'], default: 'DESC' }, description: 'Sorting order' },
+        ],
+        responses: {
+          200: { description: 'Location history retrieved successfully' },
         },
       },
     },
@@ -1249,7 +1342,16 @@ const swaggerSpec = {
   },
 };
 
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, { customSiteTitle: 'SMS & GPS Gateway Docs' }));
+app.use(
+  '/api-docs',
+  swaggerUi.serve,
+  swaggerUi.setup(swaggerSpec, {
+    customSiteTitle: 'SMS & GPS Gateway Docs',
+    swaggerOptions: {
+      persistAuthorization: true,
+    },
+  })
+);
 
 // ── Mount GPS Routes ──────────────────────────────────────────────────────────
 app.use('/api/gps', gpsRoutes);

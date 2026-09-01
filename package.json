@@ -7,7 +7,7 @@
     "dev": "node --watch index.js",
     "gt06:test": "node test/gt06-simulator.js",
     "hq:test": "node test/hq-simulator.js",
-    "test": "node test/gt06-hq.test.js && node test/account-deletion.test.js && node test/auth-password-recovery.test.js && node test/simulate-trip.test.js && node test/command-queue.test.js"
+    "test": "node test/gt06-hq.test.js && node test/account-deletion.test.js && node test/auth-password-recovery.test.js && node test/simulate-trip.test.js && node test/command-queue.test.js && node test/location-history.test.js && node test/duplicate-device-registration.test.js"
   },
   "keywords": [],
   "author": "",

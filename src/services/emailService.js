@@ -197,8 +197,93 @@ async function sendPasswordResetOtp(email, code) {
   return sendEmail({ to: email, subject, text, html });
 }
 
+/**
+ * Send a security alert email when an unauthorized attempt is made to register an already-registered device.
+ *
+ * @param {string} email - Registered owner's email address
+ * @param {object} details
+ * @param {string} details.imei - Device IMEI
+ * @param {string} [details.deviceName] - Device name
+ * @param {string} [details.attemptedBy] - User or email that attempted registration
+ * @param {string} [details.ip] - IP address of the attempt
+ * @param {string} [details.timestamp] - Timestamp of the attempt
+ * @returns {Promise<boolean>}
+ */
+async function sendDuplicateDeviceRegistrationAlert(email, { imei, deviceName = '', attemptedBy = '', ip = '', timestamp = '' }) {
+  if (!email) return false;
+
+  const subject = `Security Alert: Attempted Registration of Your GPS Device (${imei})`;
+  const attemptTime = timestamp || new Date().toUTCString();
+  const text = `Security Alert: A registration attempt was made for your GPS Tracker (IMEI: ${imei}${deviceName ? `, Name: ${deviceName}` : ''}) on ${attemptTime} from IP ${ip || 'Unknown'}.\n\nThe attempt was blocked because this device is already registered to your account.\n\nIf this was not you, no action is required as your device remains secure in your account. If you believe your device IMEI has been compromised, please contact support.`;
+
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Security Alert - Duplicate Registration Attempt</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #0f172a; margin: 0; padding: 20px; color: #f8fafc; }
+        .card { max-width: 520px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 32px; border: 1px solid #334155; }
+        .header { text-align: center; margin-bottom: 24px; }
+        .badge { display: inline-block; background: #f59e0b; color: #0f172a; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+        .title { font-size: 20px; font-weight: 700; color: #ffffff; margin-top: 12px; margin-bottom: 8px; }
+        .alert-box { background: #0f172a; border-left: 4px solid #f59e0b; border-radius: 8px; padding: 16px; margin: 20px 0; text-align: left; }
+        .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #1e293b; font-size: 13px; }
+        .row:last-child { border-bottom: none; }
+        .label { color: #94a3b8; }
+        .value { color: #f8fafc; font-weight: 600; font-family: monospace; }
+        .info { font-size: 13px; color: #94a3b8; line-height: 1.6; margin-bottom: 16px; }
+        .footer { font-size: 11px; color: #64748b; text-align: center; border-top: 1px solid #334155; padding-top: 16px; margin-top: 24px; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="header">
+          <span class="badge">Security Notice</span>
+          <h2 class="title">Duplicate Registration Blocked</h2>
+          <p style="color: #94a3b8; font-size: 14px; margin: 0;">An attempt was made to register a GPS device already linked to your account.</p>
+        </div>
+
+        <div class="alert-box">
+          <div class="row">
+            <span class="label">Device IMEI:</span>
+            <span class="value">${imei}</span>
+          </div>
+          ${deviceName ? `<div class="row"><span class="label">Device Name:</span><span class="value">${deviceName}</span></div>` : ''}
+          <div class="row">
+            <span class="label">Attempt Time:</span>
+            <span class="value">${attemptTime}</span>
+          </div>
+          ${ip ? `<div class="row"><span class="label">Requester IP:</span><span class="value">${ip}</span></div>` : ''}
+          <div class="row">
+            <span class="label">Status:</span>
+            <span class="value" style="color: #ef4444;">BLOCKED (Protected)</span>
+          </div>
+        </div>
+
+        <div class="info">
+          The registration was <strong>automatically blocked</strong> by the system because this tracker is already active in your account.
+        </div>
+
+        <div class="info" style="color: #cbd5e1;">
+          <strong>Did you do this?</strong> If you were attempting to register your device again from another account or device, please note that each tracker can only belong to one account at a time.
+        </div>
+
+        <div class="footer">
+          If this wasn't you, no action is needed — your device and tracking data remain completely secure. If you suspect unauthorized activity, please contact support.
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  return sendEmail({ to: email, subject, text, html });
+}
+
 module.exports = {
   sendEmail,
   sendAccountDeletionOtp,
   sendPasswordResetOtp,
+  sendDuplicateDeviceRegistrationAlert,
 };

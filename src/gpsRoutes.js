@@ -41,11 +41,12 @@ const {
   updateDeviceInfo,
   deleteDevice,
   getLocationHistory,
+  getLocationHistoryCount,
   getCommandLogs,
   upsertDevice,
   saveLocationHistory,
 } = require('./db/mysql');
-const { sendAccountDeletionOtp, sendPasswordResetOtp } = require('./services/emailService');
+const { sendAccountDeletionOtp, sendPasswordResetOtp, sendDuplicateDeviceRegistrationAlert } = require('./services/emailService');
 const { gpsEventEmitter } = require('./gpsEvents');
 const {
   adminAuth,
@@ -800,6 +801,47 @@ router.post('/devices', async (req, res) => {
   const assignedUserId = req.user?.role === 'admin' ? (reqUserId || req.user?.id || null) : req.user?.id;
 
   try {
+    // 1. Prevent duplicate registration of the same IMEI
+    const existingDevice = await getDeviceByImei(cleanImei);
+    if (existingDevice) {
+      const ownerUserId = existingDevice.user_id || existingDevice.userId;
+      let ownerEmail = null;
+      if (ownerUserId) {
+        const owner = await findUserById(ownerUserId);
+        ownerEmail = owner?.email || null;
+      }
+
+      const alertEmail = ownerEmail || process.env.ADMIN_USER || 'momohofficial@gmail.com';
+
+      // Send security alert email to the registered owner in the background
+      if (alertEmail) {
+        sendDuplicateDeviceRegistrationAlert(alertEmail, {
+          imei: cleanImei,
+          deviceName: existingDevice.name || '',
+          attemptedBy: req.user?.email || req.user?.username || 'Unknown User',
+          ip: req.ip || req.socket?.remoteAddress || '',
+          timestamp: new Date().toUTCString(),
+        }).catch((e) => {
+          logger.error('DUPLICATE_REGISTRATION_EMAIL_ALERT_ERROR', { imei: cleanImei, error: e.message });
+        });
+      }
+
+      logger.warn('DEVICE_REGISTRATION_DUPLICATE_BLOCKED', {
+        imei: cleanImei,
+        ownerUserId,
+        ownerEmail: alertEmail,
+        attemptedByUserId: req.user?.id,
+        attemptedByUsername: req.user?.username,
+        ip: req.ip,
+      });
+
+      return res.status(409).json({
+        success: false,
+        error: 'IMEI number is registered already',
+        message: 'IMEI number is registered already',
+      });
+    }
+
     const registered = await registerNewDevice({
       imei: cleanImei,
       name: name.trim() || `Vehicle ${cleanImei.slice(-4)}`,
@@ -1362,18 +1404,71 @@ router.delete('/devices/:imei/queue', requireDeviceAccess, async (req, res) => {
 });
 
 // ── Historical Trajectory & Command Logs (MySQL) ────────────────────────────
-router.get('/devices/:imei/history', requireDeviceAccess, async (req, res) => {
-  const { imei } = req.params;
-  const limit = parseInt(req.query.limit || '100', 10);
-  const since = req.query.since || null;
-  const history = await getLocationHistory(imei, limit, since);
-  res.json({
+async function handleGetLocationHistory(req, res) {
+  const targetImei = (req.params.imei || req.query.imei || '').trim();
+
+  if (!targetImei) {
+    return res.status(400).json({
+      success: false,
+      error: 'Device IMEI is required. Specify it as /devices/:imei/history, /history/:imei, or ?imei=<IMEI>',
+    });
+  }
+
+  const hasAccess = await checkDeviceAccess(targetImei, req.user);
+  if (!hasAccess) {
+    return res.status(403).json({
+      success: false,
+      error: `Forbidden: You do not have permission to view location history for device ${targetImei}.`,
+    });
+  }
+
+  const limit = Math.min(parseInt(req.query.limit || '100', 10) || 100, 1000);
+  const offset = req.query.offset !== undefined
+    ? Math.max(parseInt(req.query.offset, 10) || 0, 0)
+    : (req.query.page ? Math.max((parseInt(req.query.page, 10) || 1) - 1, 0) * limit : 0);
+  const page = Math.floor(offset / limit) + 1;
+
+  const since = req.query.since || req.query.from || req.query.startDate || null;
+  const until = req.query.until || req.query.to || req.query.endDate || null;
+  const order = (req.query.order || 'DESC').toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+
+  const [history, total] = await Promise.all([
+    getLocationHistory(targetImei, {
+      limit,
+      offset,
+      since,
+      until,
+      order,
+    }),
+    getLocationHistoryCount(targetImei, { since, until }),
+  ]);
+
+  const totalPages = Math.ceil(total / limit);
+
+  return res.json({
     success: true,
-    imei,
+    imei: targetImei,
     count: history.length,
+    total,
+    pagination: {
+      limit,
+      offset,
+      page,
+      totalPages: totalPages || (history.length > 0 ? 1 : 0),
+      hasMore: offset + history.length < total,
+    },
+    filter: {
+      since: since || undefined,
+      until: until || undefined,
+      order,
+    },
     history,
   });
-});
+}
+
+router.get('/devices/:imei/history', handleGetLocationHistory);
+router.get('/history/:imei', handleGetLocationHistory);
+router.get('/history', handleGetLocationHistory);
 
 router.get('/devices/:imei/command-logs', requireDeviceAccess, async (req, res) => {
   const { imei } = req.params;

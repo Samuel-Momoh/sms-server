@@ -323,6 +323,16 @@ Registers a GPS tracker (e.g. Cantrack G02) to the authenticated user's account.
 }
 ```
 
+#### Duplicate IMEI Conflict Response (`409 Conflict`):
+If a device with the same IMEI is already registered in the system, registration is prevented and an automatic security alert email is dispatched to the registered owner's email address.
+```json
+{
+  "success": false,
+  "error": "IMEI number is registered already",
+  "message": "IMEI number is registered already"
+}
+```
+
 ---
 
 ### 3.2 List User's Devices & Live Telemetry
@@ -667,13 +677,27 @@ Send custom or raw ASCII commands directly to the tracker socket over TCP.
 ## 6. Trajectory History & Audit Logs APIs
 
 ### 6.1 Get Vehicle Route / Waypoint History
-Retrieves historical GPS breadcrumbs for route playback on mobile map.
+Retrieves persistent GPS breadcrumbs from MySQL for trip analysis and polyline route playback on mobile maps.
 
-- **Endpoint**: `GET /api/gps/devices/:imei/history`
+- **Endpoints**:
+  - `GET /api/gps/devices/:imei/history`
+  - `GET /api/gps/history/:imei`
+  - `GET /api/gps/history?imei=867232054850970`
 - **Auth Required**: Yes (`Bearer <TOKEN>`)
 - **Query Parameters**:
-  - `limit` (optional, default: `100`, max: `1000`)
-  - `since` (optional ISO date string, e.g. `2026-08-25T00:00:00Z`)
+  - `limit` (optional integer, default: `100`, max: `1000`)
+  - `page` (optional integer, default: `1` — 1-indexed pagination)
+  - `offset` (optional integer, default: `0`)
+  - `since` or `from` (optional ISO date/timestamp string, e.g. `2026-08-25T00:00:00Z` or `2026-08-25`)
+  - `until` or `to` (optional ISO date/timestamp string, e.g. `2026-08-30T23:59:59Z`)
+  - `order` (optional string, `DESC` [default, newest first] or `ASC` [chronological for route playback])
+
+#### Example Requests:
+```http
+GET /api/gps/devices/867232054850970/history?limit=50&order=ASC
+GET /api/gps/devices/867232054850970/history?since=2026-08-29T00:00:00Z&until=2026-08-29T23:59:59Z&order=ASC
+GET /api/gps/devices/867232054850970/history?page=2&limit=50
+```
 
 #### Success Response (`200 OK`):
 ```json
@@ -681,17 +705,47 @@ Retrieves historical GPS breadcrumbs for route playback on mobile map.
   "success": true,
   "imei": "867232054850970",
   "count": 2,
+  "total": 2,
+  "pagination": {
+    "limit": 50,
+    "offset": 0,
+    "page": 1,
+    "totalPages": 1,
+    "hasMore": false
+  },
+  "filter": {
+    "since": "2026-08-29T00:00:00Z",
+    "until": "2026-08-29T23:59:59Z",
+    "order": "ASC"
+  },
   "history": [
     {
       "id": 101,
       "imei": "867232054850970",
-      "latitude": 4.888188,
-      "longitude": 6.913182,
-      "speed_kmh": 45.0,
-      "direction": 170,
+      "latitude": 4.917230,
+      "longitude": 6.918442,
+      "speed_kmh": 0.00,
+      "direction": 0,
+      "accOn": true,
       "acc_on": 1,
+      "gpsStatus": "A",
       "gps_status": "A",
-      "recorded_at": "2026-08-25T13:25:00.000Z"
+      "recorded_at": "2026-08-29T17:53:59.000Z",
+      "created_at": "2026-08-29T17:54:01.000Z"
+    },
+    {
+      "id": 102,
+      "imei": "867232054850970",
+      "latitude": 4.917543,
+      "longitude": 6.918707,
+      "speed_kmh": 22.50,
+      "direction": 35,
+      "accOn": true,
+      "acc_on": 1,
+      "gpsStatus": "A",
+      "gps_status": "A",
+      "recorded_at": "2026-08-29T17:54:39.000Z",
+      "created_at": "2026-08-29T17:54:41.000Z"
     }
   ]
 }
