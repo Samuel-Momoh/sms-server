@@ -91,6 +91,34 @@ function seedMemoryAdmin() {
     verification_expires_at: null,
     created_at: new Date().toISOString(),
   });
+
+  // Seed demo tester account in-memory
+  const testerUser = (process.env.TESTER_EMAIL || 'tester@gmail.com').toLowerCase();
+  const testerPwd = process.env.TESTER_PWD || '@Tester123!';
+  memoryUsers.set(testerUser, {
+    id: 99,
+    username: 'tester',
+    password_hash: hashPassword(testerPwd),
+    name: 'Tester Account',
+    email: testerUser,
+    phone: '+2348099887766',
+    role: 'user',
+    is_verified: 1,
+    verification_code: null,
+    verification_expires_at: null,
+    created_at: new Date().toISOString(),
+  });
+
+  memoryDevices.set('867232054850970', {
+    imei: '867232054850970',
+    name: 'Toyota Camry - Tester Demo',
+    plate_number: 'TST-777-NG',
+    sim_number: '+2348099887766',
+    model: 'Cantrack G02',
+    user_id: 99,
+    protocol: 'HQ',
+    icon: null,
+  });
 }
 
 /**
@@ -254,6 +282,32 @@ async function seedDefaultAdmin() {
       });
     } else if (!rows[0].is_verified) {
       await pool.query('UPDATE users SET is_verified = 1 WHERE id = ?', [rows[0].id]);
+    }
+
+    // Seed tester@gmail.com account
+    const testerUser = (process.env.TESTER_EMAIL || 'tester@gmail.com').toLowerCase();
+    const testerPwd = process.env.TESTER_PWD || '@Tester123!';
+    const [tRows] = await pool.query('SELECT * FROM users WHERE email = ? LIMIT 1', [testerUser]);
+    let testerId;
+    if (tRows.length === 0) {
+      const hashed = hashPassword(testerPwd);
+      const [res] = await pool.query(
+        'INSERT INTO users (email, username, password_hash, name, role, is_verified) VALUES (?, ?, ?, ?, ?, ?)',
+        [testerUser, 'tester', hashed, 'Tester Account', 'user', 1]
+      );
+      testerId = res.insertId;
+      logger.info('TESTER_ACCOUNT_SEEDED', { email: testerUser, userId: testerId });
+    } else {
+      testerId = tRows[0].id;
+    }
+
+    // Seed default demo vehicle for tester if none exists
+    const [dRows] = await pool.query('SELECT * FROM devices WHERE user_id = ? LIMIT 1', [testerId]);
+    if (dRows.length === 0) {
+      await pool.query(
+        'INSERT IGNORE INTO devices (imei, name, plate_number, sim_number, model, user_id, protocol) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        ['867232054850970', 'Toyota Camry - Tester Demo', 'TST-777-NG', '+2348099887766', 'Cantrack G02', testerId, 'HQ']
+      );
     }
   } catch (err) {
     logger.warn('ADMIN_SEED_ERROR', { error: err.message });
