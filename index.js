@@ -36,7 +36,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ── Swagger spec (programmatic dynamic base URL) ──────────────────────────────
+// ── Swagger spec (uses origin base URL dynamically) ───────────────────────────
 const swaggerSpec = {
   openapi: '3.0.0',
   info: {
@@ -44,18 +44,18 @@ const swaggerSpec = {
     version: '1.2.0',
     description:
       'Unified Gateway Server powered by Infobip and Cantrack/GT06 GPS Tracker TCP/WebSocket Engine.\n\n' +
-      '### Real-Time WebSocket Connection (Admin Web App)\n' +
-      `- **Socket.IO Endpoint:** \`${BASE_URL}\`\n` +
+      '### Real-Time WebSocket Connection (Mobile & Web App)\n' +
+      '- **Socket.IO Endpoint:** Current Host Origin (e.g. `http://etrack.name.ng` or `http://localhost:3000`)\n' +
       '- **Room Subscription by IMEI:** Emit `join` with `{ "imei": "867232054850970" }` to only receive events for that tracker.\n' +
       '- **Admin All Devices:** Emit `join_all` to receive real-time streams from all devices.\n' +
       '- **Events Broadcasted:** `gps:update`, `gps:heartbeat`, `gps:login`, `gps:lbs`, `gps:wifi`, `gps:confirm`, `gps:connected`, `gps:disconnected`, `gps:reconnected`, `gps:ack_sent`, `gps:command_sent`\n\n' +
       '### SMS Gateway Portal URL:\n' +
-      `\`${BASE_URL}/sendsms.php?username=USER&password=PASSWORD&number=%NUMBER%&message=%MESSAGE%\`\n`,
+      '`/sendsms.php?username=USER&password=PASSWORD&number=%NUMBER%&message=%MESSAGE%`\n',
   },
   servers: [
     {
-      url: BASE_URL,
-      description: process.env.NODE_ENV === 'development' ? 'Local dev' : 'Production',
+      url: '/',
+      description: 'Current Origin (Auto-detected domain: http://etrack.name.ng)',
     },
   ],
   tags: [
