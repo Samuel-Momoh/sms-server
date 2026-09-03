@@ -63,7 +63,7 @@ const swaggerSpec = {
       '- **Socket.IO Endpoint:** Current Host Origin (e.g. `http://etrack.name.ng` or `http://localhost:3000`)\n' +
       '- **Room Subscription by IMEI:** Emit `join` with `{ "imei": "867232054850970" }` to only receive events for that tracker.\n' +
       '- **Admin All Devices:** Emit `join_all` to receive real-time streams from all devices.\n' +
-      '- **Events Broadcasted:** `gps:update`, `gps:heartbeat`, `gps:login`, `gps:lbs`, `gps:wifi`, `gps:confirm`, `gps:connected`, `gps:disconnected`, `gps:reconnected`, `gps:ack_sent`, `gps:command_sent`\n\n' +
+      '- **Events Broadcasted:** `gps:update`, `gps:alarm`, `gps:heartbeat`, `gps:login`, `gps:lbs`, `gps:wifi`, `gps:confirm`, `gps:connected`, `gps:disconnected`, `gps:reconnected`, `gps:ack_sent`, `gps:command_sent`\n\n' +
       '### SMS Gateway Portal URL:\n' +
       '`/sendsms.php?username=USER&password=PASSWORD&number=%NUMBER%&message=%MESSAGE%`\n',
   },
@@ -74,11 +74,12 @@ const swaggerSpec = {
     },
   ],
   tags: [
-    { name: 'GPS Auth', description: 'Admin authentication for GPS management APIs' },
+    { name: 'GPS Auth', description: 'Admin & user authentication for GPS management APIs' },
     { name: 'GPS Devices', description: 'Query connected devices and telemetry states (Admin Auth Required)' },
     { name: 'GPS Commands (Cantrack A/3)', description: 'Send GPRS control commands to online GPS trackers over TCP (Admin Auth Required)' },
     { name: 'GPS Command Queue', description: 'Manage offline command queue for sleeping/disconnected trackers' },
     { name: 'GPS History', description: 'Retrieve historical trajectory and command logs from MySQL' },
+    { name: 'GPS Simulation & Testing', description: 'Trigger test alerts, alarms, and live telemetry to mobile Socket.IO streams' },
     { name: 'SMS Gateway', description: 'Send SMS via Infobip' },
   ],
   components: {
@@ -1289,6 +1290,93 @@ const swaggerSpec = {
           { in: 'path', name: 'commandId', required: true, schema: { type: 'string' }, example: 'cmd_1787739338577_8wbpw' },
         ],
         responses: { 200: { description: 'Command cancelled' } },
+      },
+    },
+
+    // ── GPS Testing & Alert Emission Routes ───────────────────────────────────
+    '/api/gps/test/emit': {
+      post: {
+        tags: ['GPS Simulation & Testing'],
+        summary: 'Emit Live Test Telemetry & Alarms to Mobile Socket.IO',
+        description: 'Broadcasts a customized GPS telemetry packet to `gps:update` and, if alarms are provided, triggers `gps:alarm` immediately across active mobile app and admin WebSocket connections.',
+        requestBody: {
+          required: false,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  imei: { type: 'string', example: '867232054850970', description: 'Target device IMEI' },
+                  alarms: {
+                    type: 'array',
+                    items: { type: 'string', enum: ['SOS', 'POWER_CUT', 'VIBRATION', 'LOW_BATTERY', 'OVERSPEED', 'FENCE_IN', 'FENCE_OUT', 'ANTI_TAMPER', 'BATTERY_REMOVED'] },
+                    example: ['SOS', 'VIBRATION'],
+                    description: 'List of alarm codes to trigger in the mobile app',
+                  },
+                  latitude: { type: 'number', example: 4.898115 },
+                  longitude: { type: 'number', example: 6.907373 },
+                  speed_kmh: { type: 'number', example: 45.5 },
+                  direction: { type: 'integer', example: 160 },
+                  accOn: { type: 'boolean', example: true },
+                  isOilCut: { type: 'boolean', example: false },
+                  isBackupBattery: { type: 'boolean', example: false },
+                  doorOpen: { type: 'boolean', example: false },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: {
+            description: 'Test telemetry and alarms broadcasted successfully to Socket.IO',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: true },
+                    message: { type: 'string' },
+                    emittedEvents: { type: 'array', items: { type: 'string' }, example: ['gps:update', 'gps:alarm'] },
+                    payload: { type: 'object' },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+
+    '/api/gps/devices/{imei}/test-alert': {
+      post: {
+        tags: ['GPS Simulation & Testing'],
+        summary: 'Trigger Test Alert for a Specific Device',
+        description: 'Convenience endpoint to fire an alert (e.g. SOS, VIBRATION, POWER_CUT, FENCE_OUT) for a specific IMEI to test in-app banners on the mobile app.',
+        parameters: [
+          { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970' },
+        ],
+        requestBody: {
+          required: false,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  alarms: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    example: ['SOS'],
+                  },
+                  speed_kmh: { type: 'number', example: 0 },
+                  accOn: { type: 'boolean', example: true },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Alert broadcasted to Socket.IO' },
+        },
       },
     },
 

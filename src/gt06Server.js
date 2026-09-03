@@ -1249,6 +1249,10 @@ function handleHqGps(socket, imei, fields, state, cmd = 'V1') {
 
   gpsEventEmitter.emit('gps:update', payload);
 
+  if (vehicleStatus.alarms && vehicleStatus.alarms.length > 0) {
+    gpsEventEmitter.emit('gps:alarm', payload);
+  }
+
   // Persist trajectory and device status to MySQL
   saveLocationHistory({
     imei,

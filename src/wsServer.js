@@ -194,6 +194,7 @@ function initWebSocketServer(httpServer) {
 
   const EVENTS_TO_FORWARD = [
     'gps:update',
+    'gps:alarm',
     'gps:heartbeat',
     'gps:login',
     'gps:lbs',

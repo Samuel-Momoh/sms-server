@@ -1915,6 +1915,112 @@ function handleStopSimulateTrip(req, res) {
   });
 }
 
+// ── Test Socket Emitter for Mobile & Web App Testing ───────────────────────────
+function handleTestEmit(req, res) {
+  const targetImei = (req.params?.imei || req.body?.imei || req.query?.imei || '867232054850970').toString().trim();
+  const rawAlarms = req.body?.alarms || req.body?.alarm || req.query?.alarms || req.query?.alarm;
+  
+  let alarms = [];
+  if (Array.isArray(rawAlarms)) {
+    alarms = rawAlarms.map((a) => String(a).trim().toUpperCase());
+  } else if (typeof rawAlarms === 'string' && rawAlarms.trim()) {
+    alarms = rawAlarms.split(',').map((a) => a.trim().toUpperCase());
+  }
+
+  const isAccOn = req.body?.accOn !== undefined ? Boolean(req.body.accOn) : true;
+  const isOilCut = req.body?.isOilCut !== undefined ? Boolean(req.body.isOilCut) : false;
+  const isBackupBattery = req.body?.isBackupBattery !== undefined ? Boolean(req.body.isBackupBattery) : false;
+  const doorOpen = req.body?.doorOpen !== undefined ? Boolean(req.body.doorOpen) : false;
+
+  const lat = req.body?.latitude !== undefined ? parseFloat(req.body.latitude) : 4.898115;
+  const lon = req.body?.longitude !== undefined ? parseFloat(req.body.longitude) : 6.907373;
+  const speed = req.body?.speed_kmh !== undefined ? parseFloat(req.body.speed_kmh) : (req.body?.speed !== undefined ? parseFloat(req.body.speed) : (isAccOn ? 45.0 : 0.0));
+  const dir = req.body?.direction !== undefined ? parseInt(req.body.direction, 10) : 160;
+  const gpsStatus = req.body?.gpsStatus || 'A';
+
+  const nowIso = new Date().toISOString();
+  const nowUtc = nowIso.replace('T', ' ').replace('Z', ' UTC').substring(0, 19) + ' UTC';
+
+  const vehicleStatus = {
+    raw: 'FFFFFBFF',
+    accOn: isAccOn,
+    gpsFixed: gpsStatus === 'A',
+    isBackupBattery,
+    isOilCut,
+    doorOpen,
+    alarms,
+  };
+
+  const payload = {
+    event: 'HQ_GPS_UPDATE',
+    protocol: 'HQ',
+    cmd: 'V1',
+    imei: targetImei,
+    remote: 'simulation:test_api',
+    latitude: lat,
+    longitude: lon,
+    speed,
+    speed_knots: parseFloat((speed / 1.852).toFixed(2)),
+    speed_kmh: speed,
+    direction: dir,
+    gpsStatus,
+    accOn: isAccOn,
+    isBackupBattery,
+    isOilCut,
+    doorOpen,
+    alarms: alarms.length > 0 ? alarms : undefined,
+    equStatusHex: 'FFFFFBFF',
+    timestamp: nowUtc,
+    isTestEmit: true,
+  };
+
+  // 1. Update in-memory state cache
+  updateDeviceState(targetImei, {
+    connected: true,
+    lastLocation: {
+      latitude: lat,
+      longitude: lon,
+      speed_kmh: speed,
+      speed_knots: parseFloat((speed / 1.852).toFixed(2)),
+      direction: dir,
+      gpsStatus,
+      timestamp: nowUtc,
+    },
+    vehicleStatus,
+    lastActivityAt: nowIso,
+  });
+
+  // 2. Emit to live socket streams
+  const emittedEvents = ['gps:update'];
+  gpsEventEmitter.emit('gps:update', payload);
+
+  if (alarms.length > 0) {
+    emittedEvents.push('gps:alarm');
+    gpsEventEmitter.emit('gps:alarm', payload);
+  }
+
+  const customEvent = req.body?.event || req.query?.event;
+  if (customEvent && !emittedEvents.includes(customEvent)) {
+    emittedEvents.push(customEvent);
+    gpsEventEmitter.emit(customEvent, payload);
+  }
+
+  logger.info('TEST_SOCKET_EMIT', {
+    imei: targetImei,
+    emittedEvents,
+    alarms,
+    payload,
+  });
+
+  res.json({
+    success: true,
+    message: `Test telemetry and alarms broadcasted successfully to Socket.IO for device ${targetImei}`,
+    emittedEvents,
+    targetRooms: [`device room: ${targetImei}`, 'admin room: all'],
+    payload,
+  });
+}
+
 router.post('/simulate', handleSimulateTelemetry);
 router.post('/devices/:imei/simulate', handleSimulateTelemetry);
 
@@ -1923,4 +2029,11 @@ router.post('/devices/:imei/simulate-trip', handleSimulateTrip);
 router.post('/devices/simulate-trip/stop', handleStopSimulateTrip);
 router.post('/devices/:imei/simulate-trip/stop', handleStopSimulateTrip);
 
+// Test Socket Emitter Endpoints
+router.post('/test/emit', handleTestEmit);
+router.post('/test/alert', handleTestEmit);
+router.post('/devices/:imei/test-emit', handleTestEmit);
+router.post('/devices/:imei/test-alert', handleTestEmit);
+
 module.exports = router;
+
