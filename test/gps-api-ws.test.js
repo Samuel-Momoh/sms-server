@@ -129,7 +129,28 @@ async function runApiAndWsTests() {
     const meData = await meRes.json();
     assert.strictEqual(meData.success, true);
     assert.strictEqual(meData.user.email, 'driver_john@example.com');
-    console.log('✅ Test 0e Passed: GET /api/gps/auth/me returns current authenticated user');
+    assert.strictEqual(Array.isArray(meData.user.registeredTokens), true);
+
+    // Register a test FCM token and verify it appears in /api/gps/auth/me
+    const fcmRegRes = await fetch(`${baseUrl}/api/gps/users/fcm-token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${userLoginData.token}`,
+      },
+      body: JSON.stringify({ token: 'test_token_driver_john_123', deviceType: 'android' }),
+    });
+    const fcmRegData = await fcmRegRes.json();
+    assert.strictEqual(fcmRegData.success, true);
+
+    const meUpdatedRes = await fetch(`${baseUrl}/api/gps/auth/me`, {
+      headers: { 'Authorization': `Bearer ${userLoginData.token}` },
+    });
+    const meUpdatedData = await meUpdatedRes.json();
+    assert.strictEqual(meUpdatedData.success, true);
+    assert.strictEqual(Array.isArray(meUpdatedData.user.registeredTokens), true);
+    assert.strictEqual(meUpdatedData.user.registeredTokens.includes('test_token_driver_john_123'), true);
+    console.log('✅ Test 0e Passed: GET /api/gps/auth/me returns current authenticated user with registeredTokens array');
 
     // ── Test 0f: Device Registration by User (with optional SVG icon) ────────
     const sampleSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 2L2 22h20L12 2z"/></svg>';

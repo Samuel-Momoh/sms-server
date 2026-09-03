@@ -668,11 +668,72 @@ router.post('/auth/account/delete', handleAccountDeletion);
 router.use(adminAuth);
 
 // ── GET /api/gps/auth/me (Current User Profile) ───────────────────────────────
-router.get('/auth/me', (req, res) => {
-  res.json({
-    success: true,
-    user: req.user,
-  });
+router.get('/auth/me', async (req, res) => {
+  try {
+    const rawUser = req.user || {};
+    const identifier = rawUser.id || rawUser.email || rawUser.username || rawUser.sub;
+
+    let dbUser = null;
+    if (rawUser.id) {
+      dbUser = await findUserById(rawUser.id);
+    }
+    if (!dbUser && (rawUser.email || rawUser.username || rawUser.sub)) {
+      dbUser = await findUserByEmailOrUsername(rawUser.email || rawUser.username || rawUser.sub);
+    }
+
+    const userId = dbUser?.id || rawUser.id || identifier;
+
+    let tokens = [];
+    if (userId) {
+      const userTokens = await getUserFcmTokens(userId);
+      if (Array.isArray(userTokens)) {
+        tokens = tokens.concat(userTokens);
+      }
+    }
+    if (rawUser.id && rawUser.id !== userId) {
+      const extra = await getUserFcmTokens(rawUser.id);
+      if (Array.isArray(extra)) tokens = tokens.concat(extra);
+    }
+    if (rawUser.email && rawUser.email !== userId) {
+      const extra = await getUserFcmTokens(rawUser.email);
+      if (Array.isArray(extra)) tokens = tokens.concat(extra);
+    }
+    if (rawUser.username && rawUser.username !== userId) {
+      const extra = await getUserFcmTokens(rawUser.username);
+      if (Array.isArray(extra)) tokens = tokens.concat(extra);
+    }
+    if (rawUser.sub && rawUser.sub !== userId) {
+      const extra = await getUserFcmTokens(rawUser.sub);
+      if (Array.isArray(extra)) tokens = tokens.concat(extra);
+    }
+
+    const registeredTokens = Array.from(new Set(tokens.filter(Boolean)));
+
+    return res.json({
+      success: true,
+      user: {
+        ...rawUser,
+        ...(dbUser ? {
+          id: dbUser.id,
+          email: dbUser.email,
+          username: dbUser.username,
+          name: dbUser.name || rawUser.name,
+          phone: dbUser.phone || rawUser.phone,
+          role: dbUser.role || rawUser.role,
+        } : {}),
+        registeredTokens,
+      },
+    });
+  } catch (err) {
+    logger.error('AUTH_ME_ERROR', { error: err.message });
+    return res.json({
+      success: true,
+      user: {
+        ...(req.user || {}),
+        registeredTokens: [],
+      },
+    });
+  }
 });
 
 // ── GET /api/gps/devices ──────────────────────────────────────────────────────
@@ -2051,16 +2112,27 @@ async function handleRegisterFcmToken(req, res) {
   }
 
   try {
-    await saveUserFcmToken(req.user.id, token, deviceType);
-    logger.info('FCM_TOKEN_REGISTERED', { userId: req.user.id, deviceType });
+    let userId = req.user?.id;
+    if (!userId && (req.user?.email || req.user?.username || req.user?.sub)) {
+      const dbUser = await findUserByEmailOrUsername(req.user.email || req.user.username || req.user.sub);
+      if (dbUser?.id) {
+        userId = dbUser.id;
+      }
+    }
+    if (!userId) {
+      userId = req.user?.sub || req.user?.email || req.user?.username || 'admin';
+    }
+
+    await saveUserFcmToken(userId, token, deviceType);
+    logger.info('FCM_TOKEN_REGISTERED', { userId, deviceType });
     return res.json({
       success: true,
       message: 'FCM device token registered successfully for push notifications',
-      userId: req.user.id,
+      userId,
       deviceType,
     });
   } catch (err) {
-    logger.error('FCM_TOKEN_REGISTER_ERROR', { userId: req.user.id, error: err.message });
+    logger.error('FCM_TOKEN_REGISTER_ERROR', { userId: req.user?.id, error: err.message });
     return res.status(500).json({ success: false, error: 'Failed to save FCM token' });
   }
 }
@@ -2073,14 +2145,25 @@ async function handleDeleteFcmToken(req, res) {
   }
 
   try {
-    await deleteUserFcmToken(req.user.id, token);
-    logger.info('FCM_TOKEN_DELETED', { userId: req.user.id });
+    let userId = req.user?.id;
+    if (!userId && (req.user?.email || req.user?.username || req.user?.sub)) {
+      const dbUser = await findUserByEmailOrUsername(req.user.email || req.user.username || req.user.sub);
+      if (dbUser?.id) {
+        userId = dbUser.id;
+      }
+    }
+    if (!userId) {
+      userId = req.user?.sub || req.user?.email || req.user?.username;
+    }
+
+    await deleteUserFcmToken(userId, token);
+    logger.info('FCM_TOKEN_DELETED', { userId });
     return res.json({
       success: true,
       message: 'FCM device token removed successfully',
     });
   } catch (err) {
-    logger.error('FCM_TOKEN_DELETE_ERROR', { userId: req.user.id, error: err.message });
+    logger.error('FCM_TOKEN_DELETE_ERROR', { userId: req.user?.id, error: err.message });
     return res.status(500).json({ success: false, error: 'Failed to delete FCM token' });
   }
 }

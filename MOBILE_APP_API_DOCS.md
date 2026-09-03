@@ -212,7 +212,11 @@ Retrieves the authenticated user's profile information.
     "username": "samuel",
     "name": "Samuel Momoh",
     "phone": "+2348012345678",
-    "role": "user"
+    "role": "user",
+    "registeredTokens": [
+      "dKz3LpQ9abc123456...",
+      "eX89mNo4def789012..."
+    ]
   }
 }
 ```
