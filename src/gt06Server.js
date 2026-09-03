@@ -23,6 +23,7 @@ const { logger } = require('./logger');
 const { gpsEventEmitter } = require('./gpsEvents');
 const { upsertDevice, saveLocationHistory } = require('./db/mysql');
 const { flushQueuedCommands } = require('./services/commandQueue');
+const { sendDeviceAlarmNotification } = require('./services/fcmService');
 
 // Dynamic flag checker for raw debugging
 const isRawDebug = () => process.env.GPS_RAW_DEBUG === 'true';
@@ -1251,6 +1252,23 @@ function handleHqGps(socket, imei, fields, state, cmd = 'V1') {
 
   if (vehicleStatus.alarms && vehicleStatus.alarms.length > 0) {
     gpsEventEmitter.emit('gps:alarm', payload);
+
+    // Dispatch FCM Push Notification for each alarm in background
+    const devState = getDeviceState(imei);
+    const devName = devState?.name || '';
+    for (const alarmType of vehicleStatus.alarms) {
+      sendDeviceAlarmNotification({
+        imei,
+        deviceName: devName,
+        alarmType,
+        latitude,
+        longitude,
+        speed: speedKmh,
+        timestamp,
+      }).catch((e) => {
+        logger.error('FCM_ALARM_DISPATCH_FAILED', { imei, alarmType, error: e.message });
+      });
+    }
   }
 
   // Persist trajectory and device status to MySQL
@@ -1467,7 +1485,7 @@ function handleHqConfirm(socket, imei, fields, state) {
       });
 
       // 3. Emit real-time GPS update
-      gpsEventEmitter.emit('gps:update', {
+      const v4Payload = {
         event: 'HQ_GPS_UPDATE',
         protocol: 'HQ',
         cmd: `V4_${cmdConfirmed}`,
@@ -1486,13 +1504,46 @@ function handleHqConfirm(socket, imei, fields, state) {
         isOilCut: vehicleStatus?.isOilCut || false,
         equStatusHex: equStatus,
         timestamp,
-      });
+      };
+
+      gpsEventEmitter.emit('gps:update', v4Payload);
+
+      if (vehicleStatus?.alarms && vehicleStatus.alarms.length > 0) {
+        gpsEventEmitter.emit('gps:alarm', v4Payload);
+
+        const devState = getDeviceState(imei);
+        const devName = devState?.name || '';
+        for (const alarmType of vehicleStatus.alarms) {
+          sendDeviceAlarmNotification({
+            imei,
+            deviceName: devName,
+            alarmType,
+            latitude,
+            longitude,
+            speed: speedKmh,
+            timestamp,
+          }).catch(() => {});
+        }
+      }
     }
   } else if (vehicleStatus) {
     updateDeviceState(imei, {
       vehicleStatus,
       lastActivityAt: new Date().toISOString(),
     });
+
+    if (vehicleStatus.alarms && vehicleStatus.alarms.length > 0) {
+      const devState = getDeviceState(imei);
+      const devName = devState?.name || '';
+      for (const alarmType of vehicleStatus.alarms) {
+        sendDeviceAlarmNotification({
+          imei,
+          deviceName: devName,
+          alarmType,
+          timestamp: new Date().toISOString(),
+        }).catch(() => {});
+      }
+    }
   }
 
   const payload = {

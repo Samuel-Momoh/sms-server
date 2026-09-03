@@ -1,3 +1,7 @@
 node_modules/
 .env
 *.log
+etrack-b00bb-firebase-adminsdk-fbsvc-ed8b03fa14.json
+*firebase-adminsdk*.json
+*-firebase-adminsdk-*.json
+serviceAccountKey.json

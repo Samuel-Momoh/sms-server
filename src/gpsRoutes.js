@@ -45,8 +45,13 @@ const {
   getCommandLogs,
   upsertDevice,
   saveLocationHistory,
+  saveUserFcmToken,
+  getUserFcmTokens,
+  deleteUserFcmToken,
+  getDeviceOwnerFcmTokens,
 } = require('./db/mysql');
 const { sendAccountDeletionOtp, sendPasswordResetOtp, sendDuplicateDeviceRegistrationAlert } = require('./services/emailService');
+const { sendDeviceAlarmNotification, sendPushNotification } = require('./services/fcmService');
 const { gpsEventEmitter } = require('./gpsEvents');
 const {
   adminAuth,
@@ -1997,6 +2002,21 @@ function handleTestEmit(req, res) {
   if (alarms.length > 0) {
     emittedEvents.push('gps:alarm');
     gpsEventEmitter.emit('gps:alarm', payload);
+
+    // Also trigger FCM Push Notification in background
+    const devState = getDeviceState(targetImei);
+    const devName = devState?.name || '';
+    for (const alarmType of alarms) {
+      sendDeviceAlarmNotification({
+        imei: targetImei,
+        deviceName: devName,
+        alarmType,
+        latitude: lat,
+        longitude: lon,
+        speed,
+        timestamp: nowUtc,
+      }).catch(() => {});
+    }
   }
 
   const customEvent = req.body?.event || req.query?.event;
@@ -2014,11 +2034,95 @@ function handleTestEmit(req, res) {
 
   res.json({
     success: true,
-    message: `Test telemetry and alarms broadcasted successfully to Socket.IO for device ${targetImei}`,
+    message: `Test telemetry and alarms broadcasted successfully to Socket.IO & Push Notifications for device ${targetImei}`,
     emittedEvents,
     targetRooms: [`device room: ${targetImei}`, 'admin room: all'],
     payload,
   });
+}
+
+// ── FCM Device Token Management Handlers ─────────────────────────────────────
+async function handleRegisterFcmToken(req, res) {
+  const token = (req.body?.token || req.body?.fcmToken || '').trim();
+  const deviceType = req.body?.deviceType || req.body?.platform || 'android';
+
+  if (!token) {
+    return res.status(400).json({ success: false, error: 'FCM token is required' });
+  }
+
+  try {
+    await saveUserFcmToken(req.user.id, token, deviceType);
+    logger.info('FCM_TOKEN_REGISTERED', { userId: req.user.id, deviceType });
+    return res.json({
+      success: true,
+      message: 'FCM device token registered successfully for push notifications',
+      userId: req.user.id,
+      deviceType,
+    });
+  } catch (err) {
+    logger.error('FCM_TOKEN_REGISTER_ERROR', { userId: req.user.id, error: err.message });
+    return res.status(500).json({ success: false, error: 'Failed to save FCM token' });
+  }
+}
+
+async function handleDeleteFcmToken(req, res) {
+  const token = (req.body?.token || req.body?.fcmToken || req.query?.token || '').trim();
+
+  if (!token) {
+    return res.status(400).json({ success: false, error: 'FCM token is required' });
+  }
+
+  try {
+    await deleteUserFcmToken(req.user.id, token);
+    logger.info('FCM_TOKEN_DELETED', { userId: req.user.id });
+    return res.json({
+      success: true,
+      message: 'FCM device token removed successfully',
+    });
+  } catch (err) {
+    logger.error('FCM_TOKEN_DELETE_ERROR', { userId: req.user.id, error: err.message });
+    return res.status(500).json({ success: false, error: 'Failed to delete FCM token' });
+  }
+}
+
+async function handleTestFcm(req, res) {
+  const token = req.body?.token;
+  const imei = req.body?.imei;
+  const title = req.body?.title || '🚨 E-Track Push Alert';
+  const body = req.body?.body || 'Test push notification received successfully!';
+  const rawAlarms = req.body?.alarms || req.body?.alarm || ['SOS'];
+  const alarms = Array.isArray(rawAlarms) ? rawAlarms : [rawAlarms];
+
+  if (token) {
+    const result = await sendPushNotification([token], {
+      title,
+      body,
+      data: {
+        type: 'TEST_ALERT',
+        imei: imei || '867232054850970',
+        alarmType: String(alarms[0] || 'SOS').toUpperCase(),
+      },
+    });
+    return res.json({ success: result.success, result });
+  }
+
+  if (imei) {
+    for (const alarm of alarms) {
+      await sendDeviceAlarmNotification({
+        imei,
+        alarmType: alarm,
+        latitude: 4.898115,
+        longitude: 6.907373,
+        speed: 45,
+      });
+    }
+    return res.json({
+      success: true,
+      message: `Push notification dispatched for device ${imei} alarms: ${alarms.join(', ')}`,
+    });
+  }
+
+  return res.status(400).json({ success: false, error: 'Either token or imei is required' });
 }
 
 router.post('/simulate', handleSimulateTelemetry);
@@ -2032,8 +2136,13 @@ router.post('/devices/:imei/simulate-trip/stop', handleStopSimulateTrip);
 // Test Socket Emitter Endpoints
 router.post('/test/emit', handleTestEmit);
 router.post('/test/alert', handleTestEmit);
+router.post('/test/fcm', handleTestFcm);
 router.post('/devices/:imei/test-emit', handleTestEmit);
 router.post('/devices/:imei/test-alert', handleTestEmit);
+
+// FCM Device Token Management (Authenticated)
+router.post('/users/fcm-token', adminAuth, handleRegisterFcmToken);
+router.delete('/users/fcm-token', adminAuth, handleDeleteFcmToken);
 
 module.exports = router;
 

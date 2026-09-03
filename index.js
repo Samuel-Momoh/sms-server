@@ -80,6 +80,7 @@ const swaggerSpec = {
     { name: 'GPS Command Queue', description: 'Manage offline command queue for sleeping/disconnected trackers' },
     { name: 'GPS History', description: 'Retrieve historical trajectory and command logs from MySQL' },
     { name: 'GPS Simulation & Testing', description: 'Trigger test alerts, alarms, and live telemetry to mobile Socket.IO streams' },
+    { name: 'FCM Push Notifications', description: 'Register FCM device tokens and dispatch push notifications when mobile app is in background/closed' },
     { name: 'SMS Gateway', description: 'Send SMS via Infobip' },
   ],
   components: {
@@ -1376,6 +1377,88 @@ const swaggerSpec = {
         },
         responses: {
           200: { description: 'Alert broadcasted to Socket.IO' },
+        },
+      },
+    },
+
+    // ── FCM Device Token Routes ───────────────────────────────────────────────
+    '/api/gps/users/fcm-token': {
+      post: {
+        tags: ['FCM Push Notifications'],
+        summary: 'Register FCM Device Token for Push Notifications',
+        description: 'Registers the mobile device FCM push token for the authenticated user so background alerts can be delivered when the app is closed or minimized.',
+        security: [{ BearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['token'],
+                properties: {
+                  token: { type: 'string', example: 'dK83...fcm_device_token', description: 'Firebase Cloud Messaging device registration token' },
+                  deviceType: { type: 'string', enum: ['android', 'ios'], example: 'android' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'FCM token registered successfully' },
+          400: { description: 'Missing token' },
+          401: { description: 'Unauthorized' },
+        },
+      },
+      delete: {
+        tags: ['FCM Push Notifications'],
+        summary: 'Remove FCM Device Token (Logout)',
+        description: 'Unregisters the FCM token so push alerts stop being sent to this specific device after user logs out.',
+        security: [{ BearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['token'],
+                properties: {
+                  token: { type: 'string', example: 'dK83...fcm_device_token' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'FCM token removed successfully' },
+          401: { description: 'Unauthorized' },
+        },
+      },
+    },
+
+    '/api/gps/test/fcm': {
+      post: {
+        tags: ['FCM Push Notifications'],
+        summary: 'Test Push Notification Dispatch',
+        description: 'Dispatches a test push notification to a specific FCM token or to the owner of a vehicle IMEI.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  token: { type: 'string', description: 'Direct device FCM token (optional)' },
+                  imei: { type: 'string', example: '867232054850970', description: 'Target vehicle IMEI (dispatches to vehicle owner)' },
+                  alarms: { type: 'array', items: { type: 'string' }, example: ['SOS', 'VIBRATION'] },
+                  title: { type: 'string', example: '🚨 E-Track Alert' },
+                  body: { type: 'string', example: 'Test push notification message' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Push notification dispatched' },
         },
       },
     },

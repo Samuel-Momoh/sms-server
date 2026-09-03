@@ -219,8 +219,22 @@ async function ensureTablesExist() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
+    // 5. FCM Push Notification Tokens Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS fcm_tokens (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        token VARCHAR(255) NOT NULL,
+        device_type VARCHAR(32) DEFAULT 'android',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_user_token (user_id, token),
+        INDEX idx_user_id (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
     logger.info('MYSQL_TABLES_INITIALIZED', {
-      tables: ['users', 'devices', 'location_history', 'command_logs'],
+      tables: ['users', 'devices', 'location_history', 'command_logs', 'fcm_tokens'],
       message: 'Database schema verified and ready.',
     });
   } catch (err) {
@@ -1153,6 +1167,9 @@ async function getLocationHistoryCount(imei, { since = null, until = null } = {}
 /**
  * Retrieve recent command logs for an IMEI.
  */
+/**
+ * Retrieve recent command logs for an IMEI.
+ */
 async function getCommandLogs(imei, limit = 50) {
   if (!pool || !isConnected || !imei) return [];
 
@@ -1164,6 +1181,129 @@ async function getCommandLogs(imei, limit = 50) {
     logger.error('MYSQL_GET_COMMAND_LOGS_ERROR', { imei, error: err.message });
     return [];
   }
+}
+
+// In-memory store: userId -> Map<token, { deviceType, updatedAt }>
+const memoryFcmTokens = new Map();
+
+/**
+ * Save / Register an FCM device token for a user.
+ */
+async function saveUserFcmToken(userId, token, deviceType = 'android') {
+  if (!userId || !token) return false;
+  const cleanUserId = Number(userId) || userId;
+  const cleanToken = String(token).trim();
+  const cleanDeviceType = String(deviceType || 'android').trim();
+
+  // In-memory update
+  if (!memoryFcmTokens.has(cleanUserId)) {
+    memoryFcmTokens.set(cleanUserId, new Map());
+  }
+  memoryFcmTokens.get(cleanUserId).set(cleanToken, {
+    token: cleanToken,
+    deviceType: cleanDeviceType,
+    updatedAt: new Date().toISOString(),
+  });
+
+  if (pool && isConnected) {
+    try {
+      const sql = `
+        INSERT INTO fcm_tokens (user_id, token, device_type)
+        VALUES (?, ?, ?)
+        ON DUPLICATE KEY UPDATE device_type = VALUES(device_type), updated_at = CURRENT_TIMESTAMP
+      `;
+      await pool.query(sql, [cleanUserId, cleanToken, cleanDeviceType]);
+      return true;
+    } catch (err) {
+      logger.error('MYSQL_SAVE_FCM_TOKEN_ERROR', { userId, error: err.message });
+    }
+  }
+  return true;
+}
+
+/**
+ * Get all registered FCM tokens for a user.
+ */
+async function getUserFcmTokens(userId) {
+  if (!userId) return [];
+  const cleanUserId = Number(userId) || userId;
+
+  if (pool && isConnected) {
+    try {
+      const [rows] = await pool.query('SELECT token FROM fcm_tokens WHERE user_id = ?', [cleanUserId]);
+      if (rows && rows.length > 0) {
+        return rows.map((r) => r.token);
+      }
+    } catch (err) {
+      logger.error('MYSQL_GET_USER_FCM_TOKENS_ERROR', { userId, error: err.message });
+    }
+  }
+
+  const userMap = memoryFcmTokens.get(cleanUserId);
+  return userMap ? Array.from(userMap.keys()) : [];
+}
+
+/**
+ * Delete an FCM token (e.g. on user logout or invalid token cleanup).
+ */
+async function deleteUserFcmToken(userId, token) {
+  if (!token) return false;
+  const cleanToken = String(token).trim();
+
+  if (userId) {
+    const cleanUserId = Number(userId) || userId;
+    const userMap = memoryFcmTokens.get(cleanUserId);
+    if (userMap) userMap.delete(cleanToken);
+  } else {
+    for (const [uid, userMap] of memoryFcmTokens.entries()) {
+      userMap.delete(cleanToken);
+    }
+  }
+
+  if (pool && isConnected) {
+    try {
+      if (userId) {
+        await pool.query('DELETE FROM fcm_tokens WHERE user_id = ? AND token = ?', [userId, cleanToken]);
+      } else {
+        await pool.query('DELETE FROM fcm_tokens WHERE token = ?', [cleanToken]);
+      }
+      return true;
+    } catch (err) {
+      logger.error('MYSQL_DELETE_FCM_TOKEN_ERROR', { userId, token: cleanToken, error: err.message });
+    }
+  }
+  return true;
+}
+
+/**
+ * Get all FCM tokens for the owner of a device by its IMEI.
+ */
+async function getDeviceOwnerFcmTokens(imei) {
+  if (!imei) return [];
+  const cleanImei = String(imei).trim();
+
+  let userId = null;
+
+  // 1. Check in-memory device
+  const memDevice = memoryDevices.get(cleanImei);
+  if (memDevice && memDevice.user_id) {
+    userId = memDevice.user_id;
+  }
+
+  // 2. Check MySQL device
+  if (!userId && pool && isConnected) {
+    try {
+      const [rows] = await pool.query('SELECT user_id FROM devices WHERE imei = ? LIMIT 1', [cleanImei]);
+      if (rows && rows.length > 0 && rows[0].user_id) {
+        userId = rows[0].user_id;
+      }
+    } catch (err) {
+      logger.error('MYSQL_GET_DEVICE_OWNER_FCM_ERROR', { imei, error: err.message });
+    }
+  }
+
+  if (!userId) return [];
+  return getUserFcmTokens(userId);
 }
 
 module.exports = {
@@ -1193,6 +1333,10 @@ module.exports = {
   getLocationHistory,
   getLocationHistoryCount,
   getCommandLogs,
+  saveUserFcmToken,
+  getUserFcmTokens,
+  deleteUserFcmToken,
+  getDeviceOwnerFcmTokens,
   isMysqlConnected: () => isConnected,
   getPool: () => pool,
 };
