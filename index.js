@@ -55,17 +55,15 @@ app.use((req, _res, next) => {
 const swaggerSpec = {
   openapi: '3.0.0',
   info: {
-    title: 'SMS Gateway & GPS Tracker Management API',
+    title: 'GPS Tracker Management API',
     version: '1.2.0',
     description:
-      'Unified Gateway Server powered by Infobip and Cantrack/GT06 GPS Tracker TCP/WebSocket Engine.\n\n' +
+      'Vehicle & Fleet Telemetry Engine with Cantrack/GT06 TCP, Real-Time Socket.IO, and Firebase Push Notifications.\n\n' +
       '### Real-Time WebSocket Connection (Mobile & Web App)\n' +
       '- **Socket.IO Endpoint:** Current Host Origin (e.g. `http://etrack.name.ng` or `http://localhost:3000`)\n' +
       '- **Room Subscription by IMEI:** Emit `join` with `{ "imei": "867232054850970" }` to only receive events for that tracker.\n' +
       '- **Admin All Devices:** Emit `join_all` to receive real-time streams from all devices.\n' +
-      '- **Events Broadcasted:** `gps:update`, `gps:alarm`, `gps:heartbeat`, `gps:login`, `gps:lbs`, `gps:wifi`, `gps:confirm`, `gps:connected`, `gps:disconnected`, `gps:reconnected`, `gps:ack_sent`, `gps:command_sent`\n\n' +
-      '### SMS Gateway Portal URL:\n' +
-      '`/sendsms.php?username=USER&password=PASSWORD&number=%NUMBER%&message=%MESSAGE%`\n',
+      '- **Events Broadcasted:** `gps:update`, `gps:alarm`, `gps:heartbeat`, `gps:login`, `gps:lbs`, `gps:wifi`, `gps:confirm`, `gps:connected`, `gps:disconnected`, `gps:reconnected`, `gps:ack_sent`, `gps:command_sent`\n',
   },
   servers: [
     {
@@ -81,7 +79,6 @@ const swaggerSpec = {
     { name: 'GPS History', description: 'Retrieve historical trajectory and command logs from MySQL' },
     { name: 'GPS Simulation & Testing', description: 'Trigger test alerts, alarms, and live telemetry to mobile Socket.IO streams' },
     { name: 'FCM Push Notifications', description: 'Register FCM device tokens and dispatch push notifications when mobile app is in background/closed' },
-    { name: 'SMS Gateway', description: 'Send SMS via Infobip' },
   ],
   components: {
     securitySchemes: {
@@ -1509,69 +1506,6 @@ const swaggerSpec = {
         },
       },
     },
-
-    // ── SMS Gateway Routes ────────────────────────────────────────────────────
-    '/sendsms.php': {
-      post: {
-        tags: ['SMS Gateway'],
-        summary: 'Send SMS via POST (classic gateway format)',
-        parameters: [
-          { in: 'query', name: 'username', required: true,  schema: { type: 'string' }, example: 'admin' },
-          { in: 'query', name: 'password', required: true,  schema: { type: 'string' }, example: 'secret' },
-          { in: 'query', name: 'number',   required: true,  schema: { type: 'string' }, example: '08012345678' },
-          { in: 'query', name: 'message',  required: true,  schema: { type: 'string' }, example: 'Hello from the gateway!' },
-        ],
-        responses: {
-          200: { description: 'SMS sent' },
-          400: { description: 'Missing number or message' },
-          401: { description: 'Bad credentials' },
-          500: { description: 'Infobip error' },
-        },
-      },
-      get: {
-        tags: ['SMS Gateway'],
-        summary: 'Send SMS via GET (classic gateway format)',
-        parameters: [
-          { in: 'query', name: 'username', required: true,  schema: { type: 'string' }, example: 'admin' },
-          { in: 'query', name: 'password', required: true,  schema: { type: 'string' }, example: 'secret' },
-          { in: 'query', name: 'number',   required: true,  schema: { type: 'string' }, example: '08012345678' },
-          { in: 'query', name: 'message',  required: true,  schema: { type: 'string' }, example: 'Hello!' },
-        ],
-        responses: {
-          200: { description: 'SMS sent' },
-          400: { description: 'Missing number or message' },
-          401: { description: 'Bad credentials' },
-          500: { description: 'Infobip error' },
-        },
-      },
-    },
-
-    '/send-sms': {
-      post: {
-        tags: ['SMS Gateway'],
-        summary: 'Send SMS via JSON body (REST)',
-        requestBody: {
-          required: true,
-          content: {
-            'application/json': {
-              schema: {
-                type: 'object',
-                required: ['number', 'message'],
-                properties: {
-                  number:  { type: 'string', example: '08012345678' },
-                  message: { type: 'string', example: 'Hello!' },
-                },
-              },
-            },
-          },
-        },
-        responses: {
-          200: { description: 'SMS sent' },
-          400: { description: 'Missing fields' },
-          500: { description: 'Infobip error' },
-        },
-      },
-    },
   },
 };
 
@@ -1579,7 +1513,7 @@ app.use(
   '/api-docs',
   swaggerUi.serve,
   swaggerUi.setup(swaggerSpec, {
-    customSiteTitle: 'SMS & GPS Gateway Docs',
+    customSiteTitle: 'GPS Tracker Management API Docs',
     swaggerOptions: {
       persistAuthorization: true,
     },
@@ -1591,7 +1525,7 @@ app.use('/api/gps', gpsRoutes);
 
 // ── Root Route ────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
-  res.json({ status: 'ok', service: 'SMS & GPS Gateway Server', docs: '/api-docs' });
+  res.json({ status: 'ok', service: 'GPS Tracker Management Server', docs: '/api-docs' });
 });
 
 // ── SMS Handlers ──────────────────────────────────────────────────────────────
