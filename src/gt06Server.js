@@ -23,7 +23,7 @@ const { logger } = require('./logger');
 const { gpsEventEmitter } = require('./gpsEvents');
 const { upsertDevice, saveLocationHistory } = require('./db/mysql');
 const { flushQueuedCommands } = require('./services/commandQueue');
-const { sendDeviceAlarmNotification } = require('./services/fcmService');
+const { sendDeviceAlarmNotification, sendDeviceCommandConfirmNotification } = require('./services/fcmService');
 
 // Dynamic flag checker for raw debugging
 const isRawDebug = () => process.env.GPS_RAW_DEBUG === 'true';
@@ -1562,6 +1562,20 @@ function handleHqConfirm(socket, imei, fields, state) {
 
   logger.info('HQ_COMMAND_CONFIRM', payload);
   gpsEventEmitter.emit('gps:confirm', payload);
+
+  // Dispatch FCM Push Notification for command confirmation in background
+  const devState = getDeviceState(imei);
+  const devName = devState?.name || '';
+  sendDeviceCommandConfirmNotification({
+    imei,
+    deviceName: devName,
+    cmdConfirmed,
+    status,
+    details: rest,
+    timestamp: payload.timestamp,
+  }).catch((e) => {
+    logger.error('FCM_COMMAND_CONFIRM_FAILED', { imei, cmdConfirmed, error: e.message });
+  });
 }
 
 const buildSecumoreCommand = buildCantrackCommand;

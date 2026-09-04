@@ -952,3 +952,67 @@ Streams an array of rich telemetry objects or latitude/longitude coordinates seq
   "steps": 1
 }
 ```
+
+---
+
+## 9. FCM Push Notifications (Background & Closed App Alerts)
+
+### 9.1 Register Mobile FCM Token
+Call this endpoint upon mobile app launch or immediately after user authentication.
+
+- **Endpoint**: `POST /api/gps/users/fcm-token`
+- **Auth**: `Bearer <JWT>`
+- **Request Body**:
+```json
+{
+  "token": "dK83b_xR98Q:APA91bFw7...",
+  "deviceType": "android"
+}
+```
+
+### 9.2 Remove FCM Token (Logout)
+- **Endpoint**: `DELETE /api/gps/users/fcm-token`
+- **Auth**: `Bearer <JWT>`
+- **Request Body**:
+```json
+{
+  "token": "dK83b_xR98Q:APA91bFw7..."
+}
+```
+
+---
+
+### 9.3 Pure Push Notification Testing API (Zero Socket Events)
+Use this API to test Firebase push notifications arriving on your phone when the app is in the background or completely closed, without triggering `gps:update` or `gps:alarm` WebSockets.
+
+- **Endpoint**: `POST /api/gps/test/push` (or `POST /api/gps/test/fcm`)
+- **Headers**: `Content-Type: application/json`
+
+#### Test 1: Send Pure Alarm Push (By IMEI)
+```json
+{
+  "imei": "867232054850970",
+  "type": "ALARM",
+  "alarms": ["SOS", "VIBRATION"]
+}
+```
+
+#### Test 2: Send Pure Command Confirmation Push (By IMEI)
+```json
+{
+  "imei": "867232054850970",
+  "type": "COMMAND_CONFIRM",
+  "cmdConfirmed": "S20",
+  "details": "1,1"
+}
+```
+
+#### Test 3: Send Pure Push Directly to Token
+```json
+{
+  "token": "YOUR_PHONE_FCM_TOKEN_HERE",
+  "title": "🚨 Pure Push Test",
+  "body": "This notification was sent with 0 socket broadcasts!"
+}
+```
+

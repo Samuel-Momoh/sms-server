@@ -51,7 +51,13 @@ const {
   getDeviceOwnerFcmTokens,
 } = require('./db/mysql');
 const { sendAccountDeletionOtp, sendPasswordResetOtp, sendDuplicateDeviceRegistrationAlert } = require('./services/emailService');
-const { sendDeviceAlarmNotification, sendPushNotification } = require('./services/fcmService');
+const {
+  sendDeviceAlarmNotification,
+  sendDeviceCommandConfirmNotification,
+  sendPushNotification,
+  getAlarmNotificationContent,
+  getCommandConfirmNotificationContent,
+} = require('./services/fcmService');
 const { gpsEventEmitter } = require('./gpsEvents');
 const {
   adminAuth,
@@ -2169,43 +2175,135 @@ async function handleDeleteFcmToken(req, res) {
 }
 
 async function handleTestFcm(req, res) {
-  const token = req.body?.token;
-  const imei = req.body?.imei;
-  const title = req.body?.title || '🚨 E-Track Push Alert';
-  const body = req.body?.body || 'Test push notification received successfully!';
+  const token = (req.body?.token || req.query?.token || '').trim();
+  const imei = (req.body?.imei || req.params?.imei || req.query?.imei || '').trim();
+  const userId = req.body?.userId || req.query?.userId;
+  const customTitle = req.body?.title;
+  const customBody = req.body?.body;
+  const type = (req.body?.type || 'ALARM').toUpperCase();
   const rawAlarms = req.body?.alarms || req.body?.alarm || ['SOS'];
   const alarms = Array.isArray(rawAlarms) ? rawAlarms : [rawAlarms];
+  const cmdConfirmed = req.body?.cmdConfirmed || req.body?.cmd;
+  const status = req.body?.status || 'OK';
+  const details = req.body?.details || req.body?.params || [];
+
+  // PURE PUSH NOTIFICATION ONLY (Zero WebSocket events emitted)
 
   if (token) {
+    let title = customTitle || '🚨 E-Track Push Alert';
+    let body = customBody || 'Test push notification received successfully!';
+
+    if (!customTitle && type === 'COMMAND_CONFIRM' && cmdConfirmed) {
+      const content = getCommandConfirmNotificationContent(cmdConfirmed, status, details, '', imei || '867232054850970');
+      title = content.title;
+      body = content.body;
+    } else if (!customTitle && alarms.length > 0) {
+      const content = getAlarmNotificationContent(alarms[0], '', imei || '867232054850970', 45);
+      title = content.title;
+      body = content.body;
+    }
+
     const result = await sendPushNotification([token], {
       title,
       body,
       data: {
-        type: 'TEST_ALERT',
+        type,
         imei: imei || '867232054850970',
         alarmType: String(alarms[0] || 'SOS').toUpperCase(),
+        cmdConfirmed: cmdConfirmed ? String(cmdConfirmed).toUpperCase() : '',
+        status,
+        click_action: 'FLUTTER_NOTIFICATION_CLICK',
       },
     });
-    return res.json({ success: result.success, result });
+
+    return res.json({
+      success: result.success,
+      message: result.success ? 'Pure push notification sent to target token (zero socket events)' : 'Failed to deliver push notification',
+      socketEmitted: false,
+      result,
+    });
+  }
+
+  if (userId) {
+    const tokens = await getUserFcmTokens(userId);
+    if (!tokens || tokens.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: `No registered FCM tokens found for userId ${userId}`,
+        socketEmitted: false,
+      });
+    }
+
+    const title = customTitle || '🚨 E-Track Push Alert';
+    const body = customBody || 'Test push notification received successfully!';
+    const result = await sendPushNotification(tokens, {
+      title,
+      body,
+      data: {
+        type,
+        userId: String(userId),
+        click_action: 'FLUTTER_NOTIFICATION_CLICK',
+      },
+    });
+
+    return res.json({
+      success: result.success,
+      message: `Pure push notification sent to ${tokens.length} token(s) for userId ${userId} (zero socket events)`,
+      tokensCount: tokens.length,
+      socketEmitted: false,
+      result,
+    });
   }
 
   if (imei) {
+    const cleanImei = String(imei).trim();
+    const tokens = await getDeviceOwnerFcmTokens(cleanImei);
+    if (!tokens || tokens.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: `No registered FCM tokens found for owner of device ${cleanImei}. Register an FCM token via POST /api/gps/users/fcm-token first.`,
+        socketEmitted: false,
+      });
+    }
+
+    if (type === 'COMMAND_CONFIRM' && cmdConfirmed) {
+      await sendDeviceCommandConfirmNotification({
+        imei: cleanImei,
+        cmdConfirmed,
+        status,
+        details,
+      });
+      return res.json({
+        success: true,
+        message: `Command confirmation push notification (${cmdConfirmed}) dispatched to device ${cleanImei} owner's ${tokens.length} registered phone(s) (zero socket events)`,
+        tokensCount: tokens.length,
+        socketEmitted: false,
+      });
+    }
+
     for (const alarm of alarms) {
       await sendDeviceAlarmNotification({
-        imei,
+        imei: cleanImei,
         alarmType: alarm,
         latitude: 4.898115,
         longitude: 6.907373,
         speed: 45,
       });
     }
+
     return res.json({
       success: true,
-      message: `Push notification dispatched for device ${imei} alarms: ${alarms.join(', ')}`,
+      message: `Pure Push Notification (${alarms.join(', ')}) dispatched to device ${cleanImei} owner's ${tokens.length} registered phone(s) (zero socket events)`,
+      tokensCount: tokens.length,
+      socketEmitted: false,
     });
   }
 
-  return res.status(400).json({ success: false, error: 'Either token or imei is required' });
+  return res.status(400).json({
+    success: false,
+    error: 'Either "token", "imei", or "userId" is required in request body.',
+    socketEmitted: false,
+  });
 }
 
 router.post('/simulate', handleSimulateTelemetry);
@@ -2216,12 +2314,17 @@ router.post('/devices/:imei/simulate-trip', handleSimulateTrip);
 router.post('/devices/simulate-trip/stop', handleStopSimulateTrip);
 router.post('/devices/:imei/simulate-trip/stop', handleStopSimulateTrip);
 
-// Test Socket Emitter Endpoints
+// Test Socket Emitter Endpoints (Emit to Sockets + Push)
 router.post('/test/emit', handleTestEmit);
 router.post('/test/alert', handleTestEmit);
-router.post('/test/fcm', handleTestFcm);
 router.post('/devices/:imei/test-emit', handleTestEmit);
 router.post('/devices/:imei/test-alert', handleTestEmit);
+
+// Pure Push Notification Test Endpoints (Zero Socket Events)
+router.post('/test/fcm', handleTestFcm);
+router.post('/test/push', handleTestFcm);
+router.post('/devices/:imei/test-fcm', handleTestFcm);
+router.post('/devices/:imei/test-push', handleTestFcm);
 
 // FCM Device Token Management (Authenticated)
 router.post('/users/fcm-token', adminAuth, handleRegisterFcmToken);

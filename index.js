@@ -1438,8 +1438,8 @@ const swaggerSpec = {
     '/api/gps/test/fcm': {
       post: {
         tags: ['FCM Push Notifications'],
-        summary: 'Test Push Notification Dispatch',
-        description: 'Dispatches a test push notification to a specific FCM token or to the owner of a vehicle IMEI.',
+        summary: 'Send Pure FCM Push Notification (Zero Sockets)',
+        description: 'Dispatches a pure FCM push notification to a specific token or to all registered tokens of a vehicle owner, WITHOUT sending any `gps:update` or `gps:alarm` Socket.IO events. Supports both Alarm alerts and Command Confirmation alerts.',
         requestBody: {
           required: true,
           content: {
@@ -1449,16 +1449,63 @@ const swaggerSpec = {
                 properties: {
                   token: { type: 'string', description: 'Direct device FCM token (optional)' },
                   imei: { type: 'string', example: '867232054850970', description: 'Target vehicle IMEI (dispatches to vehicle owner)' },
-                  alarms: { type: 'array', items: { type: 'string' }, example: ['SOS', 'VIBRATION'] },
-                  title: { type: 'string', example: '🚨 E-Track Alert' },
-                  body: { type: 'string', example: 'Test push notification message' },
+                  type: { type: 'string', enum: ['ALARM', 'COMMAND_CONFIRM'], example: 'ALARM' },
+                  alarms: { type: 'array', items: { type: 'string' }, example: ['SOS', 'VIBRATION'], description: 'List of alarm codes (when type is ALARM)' },
+                  cmdConfirmed: { type: 'string', example: 'S20', description: 'Confirmed command code (when type is COMMAND_CONFIRM)' },
+                  details: { type: 'string', example: '1,1', description: 'Command response params (e.g. 1,1 for fuel cut, 1,0 for restore)' },
+                  title: { type: 'string', example: '🚨 Custom Alert Title (optional)' },
+                  body: { type: 'string', example: 'Custom push message body (optional)' },
                 },
               },
             },
           },
         },
         responses: {
-          200: { description: 'Push notification dispatched' },
+          200: {
+            description: 'Pure push notification dispatched successfully (zero socket events)',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: true },
+                    message: { type: 'string' },
+                    socketEmitted: { type: 'boolean', example: false },
+                    tokensCount: { type: 'integer', example: 1 },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+
+    '/api/gps/devices/{imei}/test-push': {
+      post: {
+        tags: ['FCM Push Notifications'],
+        summary: 'Send Pure Push Alert to Device Owner (Zero Sockets)',
+        description: 'Convenience endpoint to send a pure push notification directly to the registered phone(s) of a specific device owner without triggering socket events.',
+        parameters: [
+          { in: 'path', name: 'imei', required: true, schema: { type: 'string' }, example: '867232054850970' },
+        ],
+        requestBody: {
+          required: false,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  alarms: { type: 'array', items: { type: 'string' }, example: ['POWER_CUT'] },
+                  title: { type: 'string' },
+                  body: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Pure push notification sent' },
         },
       },
     },

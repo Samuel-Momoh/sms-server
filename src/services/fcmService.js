@@ -319,10 +319,126 @@ async function sendDeviceAlarmNotification({
   }
 }
 
+/**
+ * Map command confirmation code to user-friendly notification title and body.
+ */
+function getCommandConfirmNotificationContent(cmdConfirmed, status, details = [], deviceName, imei) {
+  const devLabel = deviceName ? `${deviceName} (${imei.slice(-4)})` : `Vehicle ${imei.slice(-4)}`;
+  const cmd = String(cmdConfirmed || '').toUpperCase();
+  const restStr = Array.isArray(details) ? details.join(',') : String(details || '');
+
+  switch (cmd) {
+    case 'S20': {
+      // Fuel / Oil cut command: *HQ,IMEI,V4,S20,135208,1,1# (cut) or 1,0 (restore)
+      const isCut = details.includes('1,1') || (details[1] === '1' && details[2] === '1') || restStr.includes('1,1');
+      if (isCut) {
+        return {
+          title: '🛑 Engine Cut Confirmed',
+          body: `Engine cut-off executed successfully on ${devLabel}. Vehicle is immobilized.`,
+        };
+      }
+      return {
+        title: '🟢 Engine Restored Confirmed',
+        body: `Engine fuel/power supply restored successfully on ${devLabel}. Vehicle can be started.`,
+      };
+    }
+    case 'D1':
+      return {
+        title: '⏱️ Upload Interval Updated',
+        body: `GPS telemetry upload interval updated successfully on ${devLabel}.`,
+      };
+    case 'WKMD':
+      return {
+        title: '⚙️ Working Mode Configured',
+        body: `Tracker working/sleep mode updated on ${devLabel}.`,
+      };
+    case 'R1':
+      return {
+        title: '🔄 Tracker Rebooted',
+        body: `GPS tracker restart command confirmed for ${devLabel}.`,
+      };
+    case 'S1':
+      return {
+        title: '📍 Location Query Received',
+        body: `Current location query confirmed for ${devLabel}.`,
+      };
+    case 'S3':
+      return {
+        title: '📞 SOS Number Configured',
+        body: `SOS emergency contact numbers updated on ${devLabel}.`,
+      };
+    case 'S33':
+      return {
+        title: '🏎️ Overspeed Limit Configured',
+        body: `Overspeed alarm limit configured on ${devLabel}.`,
+      };
+    case 'S80':
+      return {
+        title: '📳 Vibration Alarm Configured',
+        body: `Vibration sensitivity parameters updated on ${devLabel}.`,
+      };
+    default:
+      return {
+        title: `✅ Command Confirmed: ${cmd}`,
+        body: `Tracker confirmed command ${cmd} (${status || 'OK'}) on ${devLabel}.`,
+      };
+  }
+}
+
+/**
+ * Dispatch command confirmation push notification to device owner's registered phone tokens.
+ */
+async function sendDeviceCommandConfirmNotification({
+  imei,
+  deviceName = '',
+  cmdConfirmed,
+  status = 'OK',
+  details = [],
+  timestamp,
+}) {
+  if (!imei || !cmdConfirmed) return;
+
+  try {
+    const tokens = await getDeviceOwnerFcmTokens(imei);
+    if (!tokens || tokens.length === 0) {
+      logger.info('FCM_NO_TOKENS_FOR_COMMAND_CONFIRM', { imei, cmdConfirmed });
+      return;
+    }
+
+    const { title, body } = getCommandConfirmNotificationContent(
+      cmdConfirmed,
+      status,
+      details,
+      deviceName,
+      imei
+    );
+
+    const notificationPayload = {
+      title,
+      body,
+      data: {
+        type: 'COMMAND_CONFIRM',
+        cmdConfirmed: String(cmdConfirmed).toUpperCase(),
+        imei: String(imei),
+        deviceName: deviceName || '',
+        status: status || 'OK',
+        details: Array.isArray(details) ? details.join(',') : String(details || ''),
+        timestamp: timestamp || new Date().toISOString(),
+      },
+    };
+
+    await sendPushNotification(tokens, notificationPayload);
+  } catch (err) {
+    logger.error('FCM_COMMAND_CONFIRM_DISPATCH_ERROR', { imei, cmdConfirmed, error: err.message });
+  }
+}
+
 module.exports = {
   getFcmAccessToken,
   sendSinglePushNotification,
   sendPushNotification,
   sendDeviceAlarmNotification,
+  sendDeviceCommandConfirmNotification,
   getAlarmNotificationContent,
+  getCommandConfirmNotificationContent,
 };

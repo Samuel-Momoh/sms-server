@@ -13,6 +13,7 @@ const {
 } = require('../src/db/mysql');
 const {
   getAlarmNotificationContent,
+  getCommandConfirmNotificationContent,
   getFcmAccessToken,
 } = require('../src/services/fcmService');
 
@@ -87,6 +88,63 @@ async function runFcmTests() {
   } else {
     console.log('⚠ Test 5 Skipped: No internet/network in sandbox (expected in offline sandbox)');
   }
+
+  // Test 6: Command Confirmation Notification Content Mapping
+  console.log('\n[Test 6] Validating command confirmation notification mapping...');
+  const cutContent = getCommandConfirmNotificationContent('S20', 'OK', ['135208', '1', '1'], 'Lexus RX350', '867232054850970');
+  assert(cutContent.title.includes('Engine Cut Confirmed'), 'S20 1,1 should produce Engine Cut title');
+  assert(cutContent.body.includes('immobilized'), 'S20 1,1 body should mention immobilized');
+
+  const restoreContent = getCommandConfirmNotificationContent('S20', 'OK', ['135208', '1', '0'], 'Lexus RX350', '867232054850970');
+  assert(restoreContent.title.includes('Engine Restored Confirmed'), 'S20 1,0 should produce Engine Restored title');
+
+  const d1Content = getCommandConfirmNotificationContent('D1', 'OK', ['30'], 'Lexus RX350', '867232054850970');
+  assert(d1Content.title.includes('Upload Interval'), 'D1 should produce interval title');
+
+  const wkmdContent = getCommandConfirmNotificationContent('WKMD', 'OK', ['0'], 'Lexus RX350', '867232054850970');
+  assert(wkmdContent.title.includes('Working Mode'), 'WKMD should produce working mode title');
+
+  const r1Content = getCommandConfirmNotificationContent('R1', 'OK', [], 'Lexus RX350', '867232054850970');
+  assert(r1Content.title.includes('Tracker Rebooted'), 'R1 should produce reboot title');
+
+  // Test 7: Verify Pure Push Notification route produces ZERO socket events
+  console.log('\n[Test 7] Verifying Pure Push API emits ZERO socket events...');
+  const { gpsEventEmitter } = require('../src/gpsEvents');
+  const gpsRoutes = require('../src/gpsRoutes');
+
+  const testPushLayer = gpsRoutes.stack.find((l) => l.route?.path === '/test/push' && l.route?.methods?.post);
+  const handleTestFcmFn = testPushLayer?.route?.stack?.[0]?.handle;
+  assert(typeof handleTestFcmFn === 'function', 'handleTestFcm route handler should exist');
+
+  let socketEventFired = false;
+  const onAnySocket = () => { socketEventFired = true; };
+  gpsEventEmitter.on('gps:update', onAnySocket);
+  gpsEventEmitter.on('gps:alarm', onAnySocket);
+
+  const mockRes = {
+    statusCode: 200,
+    body: null,
+    status: function (code) { this.statusCode = code; return this; },
+    json: function (data) { this.body = data; return this; },
+  };
+
+  await handleTestFcmFn(
+    {
+      body: {
+        token: 'fake_token_isolated_test',
+        title: 'Pure Push Test',
+        body: 'Testing without sockets',
+      },
+    },
+    mockRes
+  );
+
+  gpsEventEmitter.removeListener('gps:update', onAnySocket);
+  gpsEventEmitter.removeListener('gps:alarm', onAnySocket);
+
+  assert.strictEqual(socketEventFired, false, 'Pure Push API must NOT emit any socket events');
+  assert.strictEqual(mockRes.body.socketEmitted, false);
+  console.log('✔ Test 7 Passed: Verified Pure Push API dispatches FCM only with ZERO socket broadcasts');
 
   console.log('\n=============================================');
   console.log('  ALL FCM PUSH NOTIFICATION TESTS PASSED (100%)');
