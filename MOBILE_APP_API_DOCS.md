@@ -948,7 +948,7 @@ Streams an array of rich telemetry objects or latitude/longitude coordinates seq
   "latitude": 4.888188,
   "longitude": 6.913182,
   "direction": 170,
-  "batteryLevel": 100,
+  "batteryLevel": 90, 
   "steps": 1
 }
 ```
