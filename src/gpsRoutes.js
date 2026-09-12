@@ -49,7 +49,12 @@ const {
   getUserFcmTokens,
   deleteUserFcmToken,
   getDeviceOwnerFcmTokens,
+  getAppVersionConfig,
+  getAllAppVersionConfigs,
+  upsertAppVersionConfig,
+  normalizePlatform,
 } = require('./db/mysql');
+const { fetchPlayStoreVersion } = require('./services/playStore');
 const { sendAccountDeletionOtp, sendPasswordResetOtp, sendDuplicateDeviceRegistrationAlert } = require('./services/emailService');
 const {
   sendDeviceAlarmNotification,
@@ -670,6 +675,211 @@ async function handleAccountDeletion(req, res) {
 router.post('/auth/delete-account', handleAccountDeletion);
 router.post('/auth/account/delete', handleAccountDeletion);
 
+// ── Mobile App Version Check (Public — no authentication) ────────────────────
+
+/**
+ * Parse a version string such as "v1.12.3-beta" into a numeric segment array [1, 12, 3].
+ */
+function parseVersion(version) {
+  const cleaned = String(version || '').trim().replace(/^v/i, '').split(/[-+ ]/)[0];
+  if (!cleaned) return null;
+  const parts = cleaned.split('.').map((p) => parseInt(p, 10));
+  if (parts.length === 0 || parts.some((n) => Number.isNaN(n))) return null;
+  return parts;
+}
+
+/**
+ * Compare two version strings. Returns -1 if a < b, 0 if equal, 1 if a > b, null if unparsable.
+ */
+function compareVersions(a, b) {
+  const left = parseVersion(a);
+  const right = parseVersion(b);
+  if (!left || !right) return null;
+
+  const length = Math.max(left.length, right.length);
+  for (let i = 0; i < length; i += 1) {
+    const l = left[i] || 0;
+    const r = right[i] || 0;
+    if (l < r) return -1;
+    if (l > r) return 1;
+  }
+  return 0;
+}
+
+/**
+ * GET /api/gps/app-version
+ */
+async function handleAppVersionCheck(req, res) {
+  const source = { ...(req.query || {}), ...(req.body || {}) };
+  const platform = normalizePlatform(req.params.platform || source.platform || source.os || source.deviceType || 'android');
+  const installedVersion = String(
+    source.version || source.installedVersion || source.appVersion || source.current_version || ''
+  ).trim();
+  const rawBuild = source.build || source.buildNumber || source.build_number || source.versionCode;
+  const installedBuild = rawBuild === undefined || rawBuild === null || rawBuild === '' ? null : Number(rawBuild);
+
+  try {
+    const config = await getAppVersionConfig(platform);
+
+    if (!config) {
+      return res.status(404).json({
+        success: false,
+        error: `No version record configured for platform '${platform}'. Supported platforms: android, ios.`,
+      });
+    }
+
+    let store = null;
+    let storeError = null;
+    if (platform === 'android' && config.packageName) {
+      try {
+        store = await fetchPlayStoreVersion(config.packageName);
+      } catch (err) {
+        storeError = err.message;
+        logger.warn('PLAY_STORE_API_LOOKUP_FAILED', {
+          packageName: config.packageName,
+          error: err.message,
+        });
+      }
+    }
+
+    const currentVersion = (store && store.version) || config.latestVersion || null;
+    const currentBuild = (store && store.build) || config.latestBuild || null;
+
+    const updatePayload = {};
+    if (store && store.version && store.version !== config.latestVersion) updatePayload.latestVersion = store.version;
+    if (store && store.build && store.build !== config.latestBuild) updatePayload.latestBuild = store.build;
+    if (Object.keys(updatePayload).length > 0) {
+      await upsertAppVersionConfig(platform, updatePayload);
+    }
+
+    let forceUpgrade = false;
+    let needsUpdate = false;
+
+    if (installedVersion) {
+      const vsMinimum = compareVersions(installedVersion, config.minimumVersion);
+      if (vsMinimum !== null && vsMinimum < 0) forceUpgrade = true;
+
+      const vsCurrent = compareVersions(installedVersion, currentVersion);
+      if (vsCurrent !== null && vsCurrent < 0) needsUpdate = true;
+    }
+
+    if (Number.isFinite(installedBuild)) {
+      if (Number.isFinite(config.minimumBuild) && installedBuild < config.minimumBuild) forceUpgrade = true;
+      if (Number.isFinite(currentBuild) && installedBuild < currentBuild) needsUpdate = true;
+    }
+
+    if (forceUpgrade) needsUpdate = true;
+
+    return res.json({
+      success: true,
+      platform,
+      packageName: config.packageName || null,
+
+      currentVersion,
+      currentBuild,
+      source: store && store.version ? 'google-play-api' : 'database',
+      storeCheckedAt: store ? store.fetchedAt : null,
+      storeError,
+
+      minimumVersion: config.minimumVersion,
+      minimumBuild: config.minimumBuild,
+
+      installedVersion: installedVersion || null,
+      installedBuild: Number.isFinite(installedBuild) ? installedBuild : null,
+
+      forceUpgrade,
+      needsUpdate,
+    });
+
+  } catch (err) {
+    logger.error('APP_VERSION_CHECK_FAILED', { error: err.message });
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
+ * PUT /api/gps/app-version/minimum
+ * Set the minimum supported version/build. Installs below either value get forceUpgrade: true.
+ */
+async function handleSetMinimumAppVersion(req, res) {
+  const body = req.body || {};
+  const platform = normalizePlatform(body.platform || 'android');
+
+  if (platform !== 'android' && platform !== 'ios') {
+    return res.status(400).json({ success: false, error: "platform must be 'android' or 'ios'" });
+  }
+
+  const hasVersion = body.minimumVersion !== undefined;
+  const hasBuild = body.minimumBuild !== undefined;
+  if (!hasVersion && !hasBuild) {
+    return res.status(400).json({ success: false, error: 'Provide minimumVersion and/or minimumBuild' });
+  }
+
+  const updates = {};
+
+  if (hasVersion) {
+    const minimumVersion = String(body.minimumVersion || '').trim();
+    if (!parseVersion(minimumVersion)) {
+      return res.status(400).json({ success: false, error: 'minimumVersion must look like 1.4.0' });
+    }
+    updates.minimumVersion = minimumVersion;
+  }
+
+  if (hasBuild) {
+    if (body.minimumBuild === null || body.minimumBuild === '') {
+      updates.minimumBuild = null;
+    } else {
+      const minimumBuild = Number(body.minimumBuild);
+      if (!Number.isInteger(minimumBuild) || minimumBuild < 0) {
+        return res.status(400).json({ success: false, error: 'minimumBuild must be a non-negative integer or null' });
+      }
+      updates.minimumBuild = minimumBuild;
+    }
+  }
+
+  try {
+    const config = await upsertAppVersionConfig(platform, updates);
+    logger.info('APP_MINIMUM_VERSION_UPDATED', { platform, ...updates, by: req.user?.username });
+    return res.json({
+      success: true,
+      platform,
+      minimumVersion: config.minimumVersion,
+      minimumBuild: config.minimumBuild,
+      updatedAt: config.updatedAt,
+    });
+  } catch (err) {
+    logger.error('APP_MINIMUM_VERSION_UPDATE_FAILED', { platform, error: err.message });
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+/**
+ * GET /api/gps/app-version/all
+ * Stored version records for every platform. Does not call the Play Store.
+ */
+async function handleListAppVersions(_req, res) {
+  try {
+    const records = await getAllAppVersionConfigs();
+    return res.json({ success: true, count: records.length, records });
+  } catch (err) {
+    logger.error('APP_VERSION_LIST_FAILED', { error: err.message });
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+// These sit above router.use(adminAuth) so the version check stays public; the admin
+// routes authenticate themselves. Both are registered before '/app-version/:platform'
+// so "minimum" and "all" are not treated as platform names.
+router.put('/app-version/minimum', adminAuth, requireAdmin, handleSetMinimumAppVersion);
+router.get('/app-version/all', adminAuth, requireAdmin, handleListAppVersions);
+
+router.get('/app-version', handleAppVersionCheck);
+router.put('/app-version', handleAppVersionCheck);
+router.post('/app-version/check', handleAppVersionCheck);
+router.get('/app-version/:platform', handleAppVersionCheck);
+router.put('/app-version/:platform', handleAppVersionCheck);
+
+
 // ── Apply Authentication to All Protected Endpoints ──────────────────────────
 router.use(adminAuth);
 
@@ -741,6 +951,7 @@ router.get('/auth/me', async (req, res) => {
     });
   }
 });
+
 
 // ── GET /api/gps/devices ──────────────────────────────────────────────────────
 router.get('/devices', async (req, res) => {

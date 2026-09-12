@@ -1016,3 +1016,142 @@ Use this API to test Firebase push notifications arriving on your phone when the
 }
 ```
 
+
+---
+
+## 10. App Version Check (Play Store vs. Minimum Supported)
+
+Compares the version the app has installed against two things:
+
+- the **minimum supported version/build stored in the database**, which decides `forceUpgrade`, and
+- the **current production release on Google Play**, read through the Google Play Developer API, which decides `needsUpdate`.
+
+The check needs no authentication, so the app can call it on launch before the login screen. Setting the minimum and listing the stored records are admin-only.
+
+### 10.1 Check Version
+
+- **Endpoint**: `GET /api/gps/app-version?platform=android&version=1.2.0&build=120`
+- **Auth**: None
+- **Same check, other forms**:
+  - `GET /api/gps/app-version/:platform?version=1.2.0&build=120`
+  - `POST /api/gps/app-version/check` with the fields in a JSON body
+  - `PUT /api/gps/app-version` and `PUT /api/gps/app-version/:platform` with the fields in a JSON body
+
+| Field | Required | Description |
+|---|---|---|
+| `platform` | No (default `android`) | `android` or `ios`. Ignored when the platform is in the URL path |
+| `version`  | No | Installed version, e.g. `1.2.0`. A leading `v` and a `-beta` suffix are accepted |
+| `build`    | No | Installed build number / `versionCode` |
+
+#### Response:
+```json
+{
+  "success": true,
+  "platform": "android",
+  "packageName": "com.etrack.sammycodes",
+
+  "currentVersion": "1.6.2",
+  "currentBuild": 162,
+  "source": "google-play-api",
+  "storeCheckedAt": "2026-09-12T15:57:21.655Z",
+  "storeError": null,
+
+  "minimumVersion": "1.4.0",
+  "minimumBuild": 140,
+
+  "installedVersion": "1.2.0",
+  "installedBuild": 120,
+
+  "forceUpgrade": true,
+  "needsUpdate": true
+}
+```
+
+| Field | Where it comes from |
+|---|---|
+| `currentVersion` / `currentBuild` | Release name and `versionCode` of the latest production release on Google Play. Falls back to the database `latestVersion` / `latestBuild` |
+| `source` | `google-play-api` when Play answered, otherwise `database` |
+| `storeError` | Why the Play lookup failed, if it did |
+| `minimumVersion` / `minimumBuild` | Database, set with [10.2](#102-set-minimum-version--build-admin) |
+| `installedVersion` / `installedBuild` | Echo of what the caller sent |
+
+#### How the app should use the flags
+
+| `forceUpgrade` | `needsUpdate` | Meaning | Suggested UI |
+|---|---|---|---|
+| `true`  | `true`  | Installed `version` is below `minimumVersion`, **or** installed `build` is below `minimumBuild` | Blocking screen; the user must update |
+| `false` | `true`  | Still supported, but Play has a newer version or build | Dismissible "update available" prompt |
+| `false` | `false` | Up to date | Nothing |
+
+If the app sends neither `version` nor `build`, both flags are `false`.
+
+#### Store lookup behaviour
+
+- Runs for **Android only**, and only when the record has a `packageName`. iOS always answers from the database.
+- Results are cached in memory for **30 minutes** (`PLAY_STORE_CACHE_TTL_MS`), so a launch spike does not hit the Play API on every request.
+- If Play can't be reached or refuses the request, **the check still succeeds**: `currentVersion` / `currentBuild` fall back to the database, `source` becomes `"database"`, and `storeError` explains why.
+- Each successful lookup writes the Play version and build back to `latestVersion` / `latestBuild`, so the fallback stays current.
+- The server authenticates with the service account key in the project root. That account must have access to the app in Play Console (**Users and permissions**), and the Google Play Android Developer API must be enabled in its Google Cloud project.
+
+### 10.2 Set Minimum Version & Build (Admin)
+
+- **Endpoint**: `PUT /api/gps/app-version/minimum`
+- **Auth**: Admin (Bearer JWT with `role: admin`, or admin Basic auth)
+
+Sets the floor that drives `forceUpgrade`. After this call, any install whose `version` is below `minimumVersion` **or** whose `build` is below `minimumBuild` gets `forceUpgrade: true`. Send one or both fields; fields you leave out are unchanged.
+
+```json
+{
+  "platform": "android",
+  "minimumVersion": "1.4.0",
+  "minimumBuild": 140
+}
+```
+
+#### Response:
+```json
+{
+  "success": true,
+  "platform": "android",
+  "minimumVersion": "1.4.0",
+  "minimumBuild": 140,
+  "updatedAt": "2026-09-12T20:40:00.000Z"
+}
+```
+
+- `minimumVersion` must be a dotted version such as `1.4.0` (a leading `v` is accepted).
+- `minimumBuild` must be a non-negative integer. Send `null` to stop enforcing a build minimum and rely on `minimumVersion` alone.
+- Keep the two in step. The checks are independent, so raising only one still forces the upgrade for anyone below it.
+- Returns `400` for an invalid platform, version or build, `401` without credentials, and `403` for non-admin users.
+
+### 10.3 List Stored Records (Admin)
+
+- **Endpoint**: `GET /api/gps/app-version/all`
+- **Auth**: Admin
+
+Returns the database record for every platform. Does not call the Play Store.
+
+```json
+{
+  "success": true,
+  "count": 2,
+  "records": [
+    {
+      "platform": "android",
+      "packageName": "com.etrack.sammycodes",
+      "minimumVersion": "1.4.0",
+      "minimumBuild": 140,
+      "latestVersion": "1.6.2",
+      "latestBuild": 162,
+      "storeUrl": "https://play.google.com/store/apps/details?id=com.etrack.sammycodes",
+      "releaseNotes": null,
+      "message": null,
+      "updatedAt": "2026-09-12T20:40:00.000Z"
+    }
+  ]
+}
+```
+
+### 10.4 Initial Defaults
+
+Rows for `android` and `ios` are seeded on first boot from `APP_ANDROID_PACKAGE`, `APP_MIN_VERSION_ANDROID`, `APP_STORE_URL_ANDROID` and the matching `_IOS` variables. Seeding uses `INSERT IGNORE`, so changing these variables later does **not** update an existing row. After first boot, change the minimum with [10.2](#102-set-minimum-version--build-admin); `packageName` and `storeUrl` must be changed in the `app_versions` table directly.

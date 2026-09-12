@@ -39,6 +39,10 @@
     {
       "name": "FCM Push Notifications",
       "description": "Register FCM device tokens and dispatch push notifications when mobile app is in background/closed"
+    },
+    {
+      "name": "App Version",
+      "description": "Compares the installed app version against the Google Play production release and the minimum version stored in the database. The check is public; setting the minimum and listing records require admin."
     }
   ],
   "components": {
@@ -48,6 +52,137 @@
         "scheme": "bearer",
         "bearerFormat": "JWT",
         "description": "JWT Bearer token obtained from POST /api/gps/auth/login. Passed as Authorization: Bearer <token>"
+      }
+    },
+    "schemas": {
+      "AppVersionRecord": {
+        "type": "object",
+        "properties": {
+          "platform": {
+            "type": "string",
+            "example": "android"
+          },
+          "packageName": {
+            "type": "string",
+            "nullable": true,
+            "example": "com.etrack.sammycodes"
+          },
+          "minimumVersion": {
+            "type": "string",
+            "example": "1.4.0"
+          },
+          "minimumBuild": {
+            "type": "integer",
+            "nullable": true,
+            "example": 140
+          },
+          "latestVersion": {
+            "type": "string",
+            "nullable": true,
+            "example": "1.6.2"
+          },
+          "latestBuild": {
+            "type": "integer",
+            "nullable": true,
+            "example": 162
+          },
+          "storeUrl": {
+            "type": "string",
+            "nullable": true
+          },
+          "releaseNotes": {
+            "type": "string",
+            "nullable": true
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "updatedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          }
+        }
+      },
+      "AppVersionResponse": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "example": true
+          },
+          "platform": {
+            "type": "string",
+            "example": "android"
+          },
+          "packageName": {
+            "type": "string",
+            "nullable": true,
+            "example": "com.etrack.sammycodes"
+          },
+          "currentVersion": {
+            "type": "string",
+            "nullable": true,
+            "example": "1.5.0",
+            "description": "Latest version live on the Play Store (or database fallback)"
+          },
+          "currentBuild": {
+            "type": "integer",
+            "nullable": true,
+            "example": 150,
+            "description": "Latest versionCode from the Play Developer API"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "google-play-api",
+              "database"
+            ],
+            "description": "Where currentVersion came from"
+          },
+          "storeCheckedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "storeError": {
+            "type": "string",
+            "nullable": true,
+            "description": "Why the store lookup failed, if it did"
+          },
+          "minimumVersion": {
+            "type": "string",
+            "example": "1.0.0",
+            "description": "Minimum supported version from the database"
+          },
+          "minimumBuild": {
+            "type": "integer",
+            "nullable": true,
+            "example": 100
+          },
+          "installedVersion": {
+            "type": "string",
+            "nullable": true,
+            "example": "1.2.0",
+            "description": "Echo of the version the caller reported"
+          },
+          "installedBuild": {
+            "type": "integer",
+            "nullable": true,
+            "example": 120
+          },
+          "forceUpgrade": {
+            "type": "boolean",
+            "description": "true when installed version/build is below the database minimum \u2014 the user MUST update",
+            "example": false
+          },
+          "needsUpdate": {
+            "type": "boolean",
+            "description": "true when a newer version is available on the Play Store \u2014 optional but recommended update",
+            "example": true
+          }
+        }
       }
     }
   },
@@ -2594,7 +2729,7 @@
                   },
                   "title": {
                     "type": "string",
-                    "example": "🚨 Custom Alert Title (optional)"
+                    "example": "\ud83d\udea8 Custom Alert Title (optional)"
                   },
                   "body": {
                     "type": "string",
@@ -2684,6 +2819,419 @@
         "responses": {
           "200": {
             "description": "Pure push notification sent"
+          }
+        }
+      }
+    },
+    "/api/gps/app-version": {
+      "get": {
+        "tags": [
+          "App Version"
+        ],
+        "security": [],
+        "summary": "Check app version (query params)",
+        "description": "Reads the production release from the Google Play Developer API and compares it against the minimum version stored in the database. No authentication \u2014 the app calls this on launch, before login. Returns `forceUpgrade: true` if the installed version is below the database minimum, and `needsUpdate: true` if a newer version is live on the Play Store.",
+        "parameters": [
+          {
+            "name": "platform",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "android",
+                "ios"
+              ],
+              "default": "android"
+            },
+            "description": "Target platform"
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "example": "1.2.0"
+            },
+            "description": "Currently installed app version"
+          },
+          {
+            "name": "build",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "example": 120
+            },
+            "description": "Currently installed build / versionCode"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Version check result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppVersionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No version record configured for the given platform"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "App Version"
+        ],
+        "security": [],
+        "summary": "Check app version (JSON body)",
+        "description": "Same logic as the GET, but accepts parameters in a JSON request body.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "platform": {
+                    "type": "string",
+                    "enum": [
+                      "android",
+                      "ios"
+                    ],
+                    "default": "android"
+                  },
+                  "version": {
+                    "type": "string",
+                    "example": "1.2.0"
+                  },
+                  "build": {
+                    "type": "integer",
+                    "example": 120
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Version check result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppVersionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No version record configured for the given platform"
+          }
+        }
+      }
+    },
+    "/api/gps/app-version/check": {
+      "post": {
+        "tags": [
+          "App Version"
+        ],
+        "security": [],
+        "summary": "Check app version (POST body)",
+        "description": "Body-based form of the version check for clients that prefer POST.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "platform": {
+                    "type": "string",
+                    "enum": [
+                      "android",
+                      "ios"
+                    ],
+                    "default": "android"
+                  },
+                  "version": {
+                    "type": "string",
+                    "example": "1.2.0"
+                  },
+                  "build": {
+                    "type": "integer",
+                    "example": 120
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Version check result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppVersionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No version record configured for the given platform"
+          }
+        }
+      }
+    },
+    "/api/gps/app-version/minimum": {
+      "put": {
+        "tags": [
+          "App Version"
+        ],
+        "summary": "Set minimum supported version / build (admin)",
+        "description": "Stores the minimum supported version and build number for a platform. Any install with `version` below `minimumVersion` or `build` below `minimumBuild` gets `forceUpgrade: true` from the version check, and the app blocks until the user updates. Send one or both fields; fields you omit are left unchanged. Send `minimumBuild: null` to stop enforcing a build minimum.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "platform": {
+                    "type": "string",
+                    "enum": [
+                      "android",
+                      "ios"
+                    ],
+                    "default": "android"
+                  },
+                  "minimumVersion": {
+                    "type": "string",
+                    "example": "1.4.0"
+                  },
+                  "minimumBuild": {
+                    "type": "integer",
+                    "nullable": true,
+                    "example": 140
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Minimum updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": true
+                    },
+                    "platform": {
+                      "type": "string",
+                      "example": "android"
+                    },
+                    "minimumVersion": {
+                      "type": "string",
+                      "example": "1.4.0"
+                    },
+                    "minimumBuild": {
+                      "type": "integer",
+                      "nullable": true,
+                      "example": 140
+                    },
+                    "updatedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid platform, version or build"
+          },
+          "401": {
+            "description": "Missing or invalid credentials"
+          },
+          "403": {
+            "description": "Admin privilege required"
+          }
+        }
+      }
+    },
+    "/api/gps/app-version/all": {
+      "get": {
+        "tags": [
+          "App Version"
+        ],
+        "summary": "List stored version records (admin)",
+        "description": "Returns the database record for every platform. Does not call the Play Store.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "example": true
+                    },
+                    "count": {
+                      "type": "integer",
+                      "example": 2
+                    },
+                    "records": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AppVersionRecord"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials"
+          },
+          "403": {
+            "description": "Admin privilege required"
+          }
+        }
+      }
+    },
+    "/api/gps/app-version/{platform}": {
+      "get": {
+        "tags": [
+          "App Version"
+        ],
+        "security": [],
+        "summary": "Check app version by platform path",
+        "description": "Same as the query-based GET but with platform in the URL path.",
+        "parameters": [
+          {
+            "name": "platform",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "android",
+                "ios"
+              ]
+            },
+            "description": "Target platform"
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "example": "1.2.0"
+            },
+            "description": "Currently installed app version"
+          },
+          {
+            "name": "build",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "example": 120
+            },
+            "description": "Currently installed build / versionCode"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Version check result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppVersionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No version record configured for the given platform"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "App Version"
+        ],
+        "security": [],
+        "summary": "Check app version by platform path (JSON body)",
+        "description": "Same as the body-based PUT but with platform in the URL path.",
+        "parameters": [
+          {
+            "name": "platform",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "android",
+                "ios"
+              ]
+            },
+            "description": "Target platform"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "version": {
+                    "type": "string",
+                    "example": "1.2.0"
+                  },
+                  "build": {
+                    "type": "integer",
+                    "example": 120
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Version check result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppVersionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No version record configured for the given platform"
           }
         }
       }

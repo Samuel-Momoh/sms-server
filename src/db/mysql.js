@@ -10,6 +10,34 @@ const memoryUsers = new Map();
 const memoryDevices = new Map();
 const memoryLocationHistory = [];
 
+// In-memory mobile app version requirements, seeded from environment defaults
+const ANDROID_PACKAGE = process.env.APP_ANDROID_PACKAGE || 'com.etrack.sammycodes';
+
+const memoryAppVersions = new Map([
+  ['android', {
+    platform: 'android',
+    packageName: ANDROID_PACKAGE,
+    minimumVersion: process.env.APP_MIN_VERSION_ANDROID || '1.0.0',
+    minimumBuild: process.env.APP_MIN_BUILD_ANDROID ? parseInt(process.env.APP_MIN_BUILD_ANDROID, 10) : null,
+    latestVersion: process.env.APP_LATEST_VERSION_ANDROID || process.env.APP_MIN_VERSION_ANDROID || '1.0.0',
+    latestBuild: process.env.APP_LATEST_BUILD_ANDROID ? parseInt(process.env.APP_LATEST_BUILD_ANDROID, 10) : null,
+    storeUrl: process.env.APP_STORE_URL_ANDROID || `https://play.google.com/store/apps/details?id=${ANDROID_PACKAGE}`,
+    releaseNotes: null,
+    message: null,
+  }],
+  ['ios', {
+    platform: 'ios',
+    packageName: process.env.APP_IOS_BUNDLE_ID || null,
+    minimumVersion: process.env.APP_MIN_VERSION_IOS || '1.0.0',
+    minimumBuild: process.env.APP_MIN_BUILD_IOS ? parseInt(process.env.APP_MIN_BUILD_IOS, 10) : null,
+    latestVersion: process.env.APP_LATEST_VERSION_IOS || process.env.APP_MIN_VERSION_IOS || '1.0.0',
+    latestBuild: process.env.APP_LATEST_BUILD_IOS ? parseInt(process.env.APP_LATEST_BUILD_IOS, 10) : null,
+    storeUrl: process.env.APP_STORE_URL_IOS || null,
+    releaseNotes: null,
+    message: null,
+  }],
+]);
+
 /**
  * Initialize MySQL connection pool, ensure required tables exist, and seed default admin.
  */
@@ -233,8 +261,51 @@ async function ensureTablesExist() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
+    // 6. Mobile App Version Requirements Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS app_versions (
+        platform VARCHAR(16) PRIMARY KEY,
+        package_name VARCHAR(128) NULL,
+        minimum_version VARCHAR(32) NOT NULL DEFAULT '1.0.0',
+        minimum_build INT NULL,
+        latest_version VARCHAR(32) NULL,
+        latest_build INT NULL,
+        store_url VARCHAR(255) NULL,
+        release_notes TEXT NULL,
+        message VARCHAR(255) NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    // Gracefully reconcile an app_versions table created before package_name existed
+    try { await pool.query('ALTER TABLE app_versions ADD COLUMN package_name VARCHAR(128) NULL'); } catch {}
+    try { await pool.query('ALTER TABLE app_versions DROP COLUMN force_update'); } catch {}
+
+    // Seed default version rows so the mobile app always gets an answer
+    for (const [platform, defaults] of memoryAppVersions.entries()) {
+      try {
+        await pool.query(
+          `INSERT IGNORE INTO app_versions
+             (platform, package_name, minimum_version, minimum_build, latest_version, latest_build, store_url, release_notes, message)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            platform,
+            defaults.packageName,
+            defaults.minimumVersion,
+            defaults.minimumBuild,
+            defaults.latestVersion,
+            defaults.latestBuild,
+            defaults.storeUrl,
+            defaults.releaseNotes,
+            defaults.message,
+          ]
+        );
+      } catch (_) {}
+    }
+
     logger.info('MYSQL_TABLES_INITIALIZED', {
-      tables: ['users', 'devices', 'location_history', 'command_logs', 'fcm_tokens'],
+      tables: ['users', 'devices', 'location_history', 'command_logs', 'fcm_tokens', 'app_versions'],
       message: 'Database schema verified and ready.',
     });
   } catch (err) {
@@ -1306,6 +1377,148 @@ async function getDeviceOwnerFcmTokens(imei) {
   return getUserFcmTokens(userId);
 }
 
+/**
+ * Normalize a platform string to one of the supported app platforms.
+ */
+function normalizePlatform(platform) {
+  const raw = String(platform || 'android').trim().toLowerCase();
+  if (raw === 'ios' || raw === 'iphone' || raw === 'ipad' || raw === 'apple') return 'ios';
+  if (raw === 'android' || raw === 'google' || raw === 'play') return 'android';
+  return raw;
+}
+
+/**
+ * Map an app_versions row (snake_case) into the camelCase shape used by the API.
+ */
+function mapAppVersionRow(row) {
+  if (!row) return null;
+  const fallback = memoryAppVersions.get(row.platform) || {};
+  return {
+    platform: row.platform,
+    packageName: row.package_name || fallback.packageName || null,
+    minimumVersion: row.minimum_version,
+    minimumBuild: row.minimum_build === null || row.minimum_build === undefined ? null : Number(row.minimum_build),
+    latestVersion: row.latest_version || row.minimum_version,
+    latestBuild: row.latest_build === null || row.latest_build === undefined ? null : Number(row.latest_build),
+    storeUrl: row.store_url || null,
+    releaseNotes: row.release_notes || null,
+    message: row.message || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+/**
+ * Get the minimum/latest version requirements for a single platform.
+ */
+async function getAppVersionConfig(platform) {
+  const key = normalizePlatform(platform);
+
+  if (pool && isConnected) {
+    try {
+      const [rows] = await pool.query('SELECT * FROM app_versions WHERE platform = ? LIMIT 1', [key]);
+      if (rows && rows.length > 0) {
+        const config = mapAppVersionRow(rows[0]);
+        memoryAppVersions.set(key, config);
+        return config;
+      }
+    } catch (err) {
+      logger.error('MYSQL_GET_APP_VERSION_ERROR', { platform: key, error: err.message });
+    }
+  }
+
+  return memoryAppVersions.get(key) || null;
+}
+
+/**
+ * Get the version requirements for every configured platform.
+ */
+async function getAllAppVersionConfigs() {
+  if (pool && isConnected) {
+    try {
+      const [rows] = await pool.query('SELECT * FROM app_versions ORDER BY platform ASC');
+      if (rows && rows.length > 0) {
+        const configs = rows.map(mapAppVersionRow);
+        configs.forEach((c) => memoryAppVersions.set(c.platform, c));
+        return configs;
+      }
+    } catch (err) {
+      logger.error('MYSQL_GET_ALL_APP_VERSIONS_ERROR', { error: err.message });
+    }
+  }
+
+  return Array.from(memoryAppVersions.values());
+}
+
+/**
+ * Create or update the version requirements for a platform.
+ */
+async function upsertAppVersionConfig(platform, updates = {}) {
+  const key = normalizePlatform(platform);
+  // Merge onto the stored row, not the seeded defaults, so a partial update never
+  // clobbers fields this process has not read yet
+  const existing = (await getAppVersionConfig(key)) || memoryAppVersions.get(key) || {
+    platform: key,
+    packageName: null,
+    minimumVersion: '1.0.0',
+    minimumBuild: null,
+    latestVersion: '1.0.0',
+    latestBuild: null,
+    storeUrl: null,
+    releaseNotes: null,
+    message: null,
+  };
+
+  const merged = {
+    platform: key,
+    packageName: updates.packageName !== undefined ? updates.packageName : existing.packageName,
+    minimumVersion: updates.minimumVersion !== undefined ? String(updates.minimumVersion).trim() : existing.minimumVersion,
+    minimumBuild: updates.minimumBuild !== undefined ? (updates.minimumBuild === null ? null : Number(updates.minimumBuild)) : existing.minimumBuild,
+    latestVersion: updates.latestVersion !== undefined ? String(updates.latestVersion).trim() : existing.latestVersion,
+    latestBuild: updates.latestBuild !== undefined ? (updates.latestBuild === null ? null : Number(updates.latestBuild)) : existing.latestBuild,
+    storeUrl: updates.storeUrl !== undefined ? updates.storeUrl : existing.storeUrl,
+    releaseNotes: updates.releaseNotes !== undefined ? updates.releaseNotes : existing.releaseNotes,
+    message: updates.message !== undefined ? updates.message : existing.message,
+    updatedAt: new Date().toISOString(),
+  };
+
+  memoryAppVersions.set(key, merged);
+
+  if (pool && isConnected) {
+    try {
+      await pool.query(
+        `INSERT INTO app_versions
+           (platform, package_name, minimum_version, minimum_build, latest_version, latest_build, store_url, release_notes, message)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           package_name    = VALUES(package_name),
+           minimum_version = VALUES(minimum_version),
+           minimum_build   = VALUES(minimum_build),
+           latest_version  = VALUES(latest_version),
+           latest_build    = VALUES(latest_build),
+           store_url       = VALUES(store_url),
+           release_notes   = VALUES(release_notes),
+           message         = VALUES(message),
+           updated_at      = CURRENT_TIMESTAMP`,
+        [
+          merged.platform,
+          merged.packageName,
+          merged.minimumVersion,
+          merged.minimumBuild,
+          merged.latestVersion,
+          merged.latestBuild,
+          merged.storeUrl,
+          merged.releaseNotes,
+          merged.message,
+        ]
+      );
+    } catch (err) {
+      logger.error('MYSQL_UPSERT_APP_VERSION_ERROR', { platform: key, error: err.message });
+    }
+  }
+
+  return merged;
+}
+
 module.exports = {
   initMysql,
   createUser,
@@ -1337,6 +1550,10 @@ module.exports = {
   getUserFcmTokens,
   deleteUserFcmToken,
   getDeviceOwnerFcmTokens,
+  getAppVersionConfig,
+  getAllAppVersionConfigs,
+  upsertAppVersionConfig,
+  normalizePlatform,
   isMysqlConnected: () => isConnected,
   getPool: () => pool,
 };
