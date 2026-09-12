@@ -1520,6 +1520,12 @@ app.use(
   })
 );
 
+// Serve raw Swagger/OpenAPI specification JSON
+app.get(['/api-docs.json', '/swagger.json'], (_req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.send(swaggerSpec);
+});
+
 // ── Mount GPS Routes ──────────────────────────────────────────────────────────
 app.use('/api/gps', gpsRoutes);
 
